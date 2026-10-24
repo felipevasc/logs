@@ -77,7 +77,7 @@ test("ignore, fixed, variation and optional change how a piece is written", () =
   r = M.apply(sample, r.segments, "ignore", at(sample, "falha"));
   assert.ok(M.compile(sample, r.segments).startsWith("%{WORD}"));
   const opt = M.apply(sample, M.apply(sample, [], "extract", at(sample, "ana")).segments, "optional", at(sample, "ana"));
-  assert.equal(M.compile(sample, opt.segments), "(?:%{WORD:usuario})?");
+  assert.equal(M.compile(sample, opt.segments), "(?:usuario=%{WORD:usuario})?");
   const loose = M.apply("n 42", M.apply("n 42", [], "extract", { start: 0, end: 1 }).segments, "fixed", { start: 1, end: 4 });
   assert.equal(M.compile("n 42", loose.segments), "%{WORD:" + loose.segments[0].name + "} 42");
   assert.match(M.apply(sample, [], "optional", at(sample, "ana")).error, /antes/);
@@ -124,4 +124,13 @@ test("painting never overlaps and keeps every character", () => {
   const parts = M.paintPlan("abcdef", [{ start: 1, end: 3, field: "a" }, { start: 2, end: 5, field: "b" }, { start: 4, end: 6, field: "c" }]);
   assert.equal(parts.map((p) => p.text).join(""), "abcdef");
   assert.deepEqual(plain(parts.filter((p) => p.field).map((p) => p.field)), ["a", "c"]);
+});
+
+test("the key that names the first value stays as an anchor, other leading text does not", () => {
+  const first = M.apply(sample, [], "extract", at(sample, "ana"));
+  assert.ok(M.compile(sample, first.segments).startsWith("usuario=%{WORD:usuario}"));
+  const ip = M.apply(sample, [], "extract", at(sample, "10.0.0.5"));
+  assert.ok(M.compile(sample, ip.segments).startsWith("%{NOTSPACE:"));
+  const spaced = M.apply("nome: ana", [], "extract", { start: 6, end: 9 });
+  assert.equal(M.compile("nome: ana", spaced.segments), "nome: %{WORD:nome}");
 });

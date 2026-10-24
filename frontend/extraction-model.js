@@ -135,7 +135,8 @@ window.ExtractionModel = (() => {
     sorted.forEach((s, index) => {
       const gap = sample.slice(cursor, s.start);
       // Text before the first marked piece is not part of the pattern: the engine searches for it.
-      const gapText = index === 0 && cursor === 0 ? "" : literal(gap, s.variation);
+      // The exception is the key that names the value (`usuario=`, `user:`), which stays as an anchor.
+      const gapText = index === 0 && cursor === 0 ? literal(keyBefore(gap), false) : literal(gap, s.variation);
       const body =
         s.kind === "literal" ? literal(sample.slice(s.start, s.end), s.variation)
         : s.kind === "ignore" ? `%{${s.token || "DATA"}}`
@@ -144,6 +145,15 @@ window.ExtractionModel = (() => {
       cursor = s.end;
     });
     return out;
+  }
+  /** The trailing `word=` / `word:` of a text (at most 24 characters), or nothing. */
+  function keyBefore(gap) {
+    let end = gap.length;
+    while (end > 0 && gap[end - 1] === " ") end--;
+    if (end === 0 || !"=:".includes(gap[end - 1])) return "";
+    let start = end - 1;
+    while (start > 0 && !isSpace(gap[start - 1]) && end - start < 24) start--;
+    return gap.slice(start, gap.length);
   }
   /** Where a value that starts at `start` ends when nothing else was said: at the next separator. */
   function untilSeparator(text, start) {

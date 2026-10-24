@@ -1,6 +1,7 @@
-/* Extração e normalização: presentation, ownership and interaction contracts in the browser
- * preview. The native engine is replaced by canned answers here; Grok/PCRE2 semantics,
- * ranges, conversions and indexes are verified by the Rust tests and test-local-native.mjs. */
+/* Extração e normalização: contratos de apresentação, posse e interação no navegador. O motor
+ * nativo é trocado aqui por respostas simuladas (a conversão Grok→RegExp abaixo existe só neste
+ * teste); a semântica real do Grok/PCRE2, as posições, as conversões e os índices são verificados
+ * pelos testes Rust e por test-local-native.mjs. */
 import assert from "node:assert/strict";
 import { launchBrowser } from "./browser.mjs";
 import { mkdirSync } from "node:fs";
@@ -10,137 +11,190 @@ const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));
 mkdirSync("output/playwright", { recursive: true });
 await page.addInitScript(() => {
-  const line = (user, ip, ms) => `falha ${ip} usuario=${user} acao=login duracao=${ms}ms`;
-  const texts = [line("ana", "10.0.0.5", "12.5"), line("bruno", "192.168.1.20", "3"), "linha sem o formato"];
+  const http = ['10.0.0.5 - ana [23/Oct/2026:17:05:09 +0000] "GET /index.html HTTP/1.1" 200 5120', '192.168.1.20 - - [23/Oct/2026:17:05:11 -0300] "POST /api/login HTTP/1.1" 401 87', '10.0.0.7 - - [23/Oct/2026:17:06:00 +0000] "GET /x HTTP/1.1" 404 -'];
+  const kv = ["2026-10-23 17:05:09 login usuario=ana ip=10.0.0.5 duracao=12.5ms", "2026-10-23 17:05:44 login usuario=bruno ip=192.168.1.20 duracao=3ms", "2026-10-23 17:06:12 login usuario=carla ip=10.0.0.9 duracao=12,5ms", "linha fora do formato"];
+  const known = { id: "http-access-log", title: "Log de acesso HTTP", ratio: 1, description: "", map: { id: "http-access-log", version: "1", title: "HTTP", schema: 2, rules: [{ id: "combined", extract: { kind: "grok", patterns: ["%{IP:cliente} - %{NOTSPACE:usuario} \\[%{DATA:quando}\\] \"%{WORD:metodo} %{NOTSPACE:caminho} HTTP/1.1\" %{INT:status} %{NOTSPACE:bytes}"], anchor: "search", source: "message" }, fields: { cliente: { from: ["cliente"], type: "ip" }, usuario: { from: ["usuario"] }, metodo: { from: ["metodo"] }, caminho: { from: ["caminho"] }, status: { from: ["status"], type: "integer" } } }] } };
+  const sample = (list, file) => list.map((text, id) => ({ id, eventRef: `${file}:${id}`, file: `C:\\logs\\${file}`, fileName: file, offset: String(id * 90), text }));
+  // Só para este teste: converte o padrão Grok em RegExp para simular o motor.
+  const TOK = { IP: "(?:\\d{1,3}\\.){3}\\d{1,3}", NOTSPACE: "\\S+", DATA: ".*?", WORD: "\\w+", INT: "\\d+", NUMBER: "-?[\\d.,]+", TIMESTAMP_ISO8601: "\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d" };
+  function run(pattern, text) {
+    const names = [];
+    const body = pattern.replace(/%\{(\w+)(?::(\w+))?(?::\w+)?\}/g, (_, t, n) => { names.push(n || null); return `(${TOK[t] || ".+?"})`; });
+    const m = new RegExp(body, "d").exec(text);
+    if (!m) return null;
+    return names.map((n, i) => n ? [n, m[i + 1], m.indices[i + 1]] : null).filter(Boolean);
+  }
+  function evaluate(map, texts) {
+    const rules = map.rules.filter((r) => r.extract?.patterns?.[0]);
+    const results = texts.map((text, id) => {
+      const trace = { rules: [], outputs: [], conflicts: [] };
+      for (const r of rules) {
+        const got = run(r.extract.patterns[0], text);
+        trace.rules.push({ rule: r.id, eligible: true, extraction: got ? "recognized" : "not_recognized", extracted: (got || []).map(([n, v, [s, e]]) => [n, v, [s, e]]) });
+        for (const [field, m] of Object.entries(r.fields || {})) {
+          const hit = (got || []).find(([n]) => n === m.from[0]);
+          if (!hit) { trace.outputs.push({ rule: r.id, field, status: "missing", original: null }); continue; }
+          let value = hit[1], status = "ok", reason = null;
+          for (const st of m.steps || []) { if (st.op === "replace") value = value.replace(st.from, st.to); if (st.op === "lowercase") value = value.toLowerCase(); }
+          if (m.type === "integer" && !/^-?\d+$/.test(value)) { status = "invalid"; reason = `“${value}” não é um número inteiro`; }
+          if (m.type === "decimal" && !/^-?\d+(\.\d+)?$/.test(value)) { status = "invalid"; reason = `“${value}” não é um decimal`; }
+          trace.outputs.push({ rule: r.id, field, status, original: hit[1], normalized: status === "ok" ? (["integer", "decimal"].includes(m.type) ? Number(value) : value) : null, range: hit[2], reason });
+        }
+      }
+      return { id, fields: {}, trace };
+    });
+    return { ok: true, scope: "text", inspected: texts.length, diagnostics: [], results, rules: [], outputs: [] };
+  }
+  const positions = (text, re, group = 0) => [...text.matchAll(re)].map((m) => { const s = m.index + (group ? m[0].indexOf(m[group]) : 0); return { sample: 0, start: s, end: s + (group ? m[group].length : m[0].length) }; });
   window.__calls = [];
   window.__mockLocalAnalysis = async ({ request: r }) => {
     window.__calls.push(r);
-    const map = r.map_json ? JSON.parse(r.map_json) : null;
-    const pattern = map?.rules?.[0]?.extract?.patterns?.[0] ?? "";
-    const outputs = map ? Object.keys(map.rules[0]?.fields || {}).map((field) => ({ field, rule: map.rules[0].id })) : [];
-    const evaluate = (list) => ({
-      ok: true, scope: "sample", inspected: list.length, diagnostics: [],
-      results: list.map((text, id) => {
-        const hit = pattern.includes("%{WORD:usuario}") && text.includes("usuario=");
-        const start = text.indexOf("usuario=") + 8, end = text.indexOf(" ", start);
-        return { id, fields: hit ? { usuario: text.slice(start, end) } : {}, error: null, trace: {
-          rules: [{ rule: "regra-1", eligible: true, extraction: hit ? "recognized" : "not_recognized", extracted: hit ? [["usuario", text.slice(start, end), [start, end]]] : [] }],
-          outputs: hit ? [{ field: "usuario", rule: "regra-1", status: "ok", source: "extract:usuario", original: text.slice(start, end), normalized: text.slice(start, end), range: [start, end] }] : [],
-          conflicts: [] } };
-      }),
-      rules: [{ rule: "regra-1", eligible: list.length, recognized: pattern.includes("%{WORD:usuario}") ? 2 : 0, notRecognized: 1, errors: 0 }],
-      outputs: [],
-    });
     switch (r.action) {
-      case "map_catalog": return { grok: { patterns: [{ name: "IP", category: "Rede", description: "Endereço IP.", example: "10.0.0.5", definition: "x" }, { name: "WORD", category: "Texto", description: "Palavra.", example: "login", definition: "x" }] }, templates: [{ id: "t", title: "Modelo de teste", description: "Exemplo.", samples: [texts[0]], map: { id: "modelo", version: "1", title: "Modelo de teste", schema: 2, rules: [{ id: "regra-1", fields: { usuario: { from: ["usuario"], type: "text" } }, extract: { kind: "grok", patterns: ["usuario=%{WORD:usuario}"], anchor: "search", source: "message" } }] } }], limits: {} };
-      case "map_check": return { valid: !pattern.includes("%{NOPE"), error: pattern.includes("%{NOPE") ? "Padrão desconhecido: NOPE" : null, diagnostics: pattern.includes("%{NOPE") ? [{ rule: "regra-1", code: "unknown", message: "Padrão desconhecido: NOPE", start: pattern.indexOf("%{NOPE"), end: pattern.indexOf("%{NOPE") + 7, alternative: 0 }] : [], outputs };
-      case "map_sample": return { isSample: true, population: 120000, candidates: 3, examined: 3, withoutSubject: 0, field: "message", seed: r.seed ?? 1, strategy: "Amostra estratificada e repetível: 3 registros examinados.", distribution: [{ file: "C:\\logs\\a.log", fileName: "a.log", records: 120000, selected: 3 }], shapes: [{ shape: "a 0.0.0.0", count: 2 }],
-        samples: texts.map((text, id) => ({ id, eventRef: `fx:${id}`, file: "C:\\logs\\a.log", fileName: "a.log", offset: String(id * 90), text, truncated: false, bytes: text.length, shape: "a", shapeRank: id === 2 ? 1 : 0, shapeCount: id === 2 ? 1 : 2 })) };
-      case "map_suggest": return { scope: "sample", total: r.texts.length, extractions: [], suggestions: [{ id: "ip", kind: "value", label: "Endereço IP", expression: "IP", field: "ip", found: 2, total: r.texts.length, examples: ["10.0.0.5"], message: "Este trecho parece um endereço ip. Encontrado em 2 de 3 amostras.", positions: [{ sample: 0, start: 6, end: 14 }] }] };
-      case "map_evaluate": return evaluate(texts.slice(0, r.samples.length));
-      case "map_try": return evaluate(r.texts);
-      case "map_scan": return { ok: true, scope: "complete", countsComplete: true, inspected: 120000, affected: 118000, conflicts: 0, elapsedMs: 900, diagnostics: [], rules: [{ rule: "regra-1", eligible: 120000, recognized: 118000, notRecognized: 2000, errors: 0, firstError: null, byAlternative: { 0: 118000 } }], outputs: [{ rule: "regra-1", field: "usuario", states: { ok: 118000, missing: 2000 } }], files: [{ file: "C:\\logs\\a.log", inspected: 120000, affected: 118000, recognized: 118000, notRecognized: 2000 }], successes: [{ id: 0, eventRef: "fx:0", file: "C:\\logs\\a.log", offset: "0", text: texts[0] }], failures: [{ id: 2, eventRef: "fx:2", file: "C:\\logs\\a.log", offset: "180", reason: "A regra regra-1 não reconheceu o texto.", text: texts[2] }] };
-      case "map_diff": return { recompute: true, global: false, added: ["usuario"], removed: [], changed: [], unchanged: [], rulesAdded: [], rulesRemoved: [], rulesChanged: ["regra-1"], indexesToRebuild: [], metadataOnly: false };
+      case "map_catalog": return { grok: { patterns: [] }, templates: [], limits: {} };
+      case "map_check": return { valid: true, error: null, diagnostics: [], outputs: [] };
+      case "map_groups": return { population: 120000, examined: 7, field: "message", seed: 1, groups: [
+        { id: "gaaaa", name: "Log de acesso HTTP", known, pool: 3, population: 71000, samples: sample(http, "access.log") },
+        { id: "gbbbb", name: "Tipo 2", known: null, pool: 4, population: 44000, samples: sample(kv, "app.log") },
+      ] };
+      case "map_suggest": {
+        const t = r.texts[0];
+        return { scope: "sample", total: 1, extractions: [], suggestions: [
+          { id: "ip", kind: "value", label: "Endereço IP", expression: "IP", field: "ip", positions: positions(t, /(?:\d{1,3}\.){3}\d{1,3}/g) },
+          { id: "iso", kind: "value", label: "Data e hora", expression: "TIMESTAMP_ISO8601", field: "timestamp", positions: positions(t, /\d{4}-\d\d-\d\d \d\d:\d\d:\d\d/g) },
+          { id: "kv:usuario", kind: "key_value", label: "usuario", expression: "NOTSPACE", field: "usuario", positions: positions(t, /usuario=(\S+)/g, 1) },
+          { id: "kv:duracao", kind: "key_value", label: "duracao", expression: "NUMBER", field: "duracao", positions: positions(t, /duracao=(\d+(?:\.\d+)?)/g, 1) },
+        ].filter((s) => s.positions.length) };
+      }
+      case "map_try": return evaluate(JSON.parse(r.map_json), r.texts);
+      case "map_diff": return { recompute: true, global: false, added: [], removed: [], changed: [], unchanged: [], rulesAdded: [], rulesRemoved: [], rulesChanged: [], indexesToRebuild: [], metadataOnly: false };
+      case "map_scan": return { ok: true, scope: "complete", countsComplete: true, inspected: 120000, affected: 118000, conflicts: 0, elapsedMs: 800, diagnostics: [], rules: [{ rule: "gbbbb", eligible: 120000, recognized: 44000, notRecognized: 76000, errors: 0 }], outputs: [], files: [], successes: [], failures: [] };
       case "save_map": return null;
       default: throw Error(`Unmocked presentation request ${r.action}`);
     }
   };
 });
-const waitReady = () => page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && state.loaded && !state.loadOverlay);
+const cols = () => page.locator("#e-table th").evaluateAll((els) => els.map((e) => e.dataset.eCol));
+const ready = () => page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && state.loaded && !state.loadOverlay);
 try {
   await page.goto(process.argv[2] || "http://127.0.0.1:4173");
-  await waitReady();
-  // The old tab is gone from Explorar and the page lives in Estrutura.
-  await page.getByRole("button", { name: "Explorar", exact: true }).click();
-  assert.deepEqual((await page.locator("#page-tabs [role=tab]").allTextContents()).map((t) => t.trim()), ["Eventos", "SQL", "Processos"]);
+  await ready();
   await page.getByRole("button", { name: "Estrutura", exact: true }).click();
   await page.locator('.nav-pages [data-page="extraction"]').click();
-  await page.waitForSelector("#ex-left");
-  assert.equal(await page.evaluate(() => document.body.dataset.page), "extraction");
+  await page.waitForSelector("#e-groups .e-group");
   assert.equal(await page.evaluate(() => document.documentElement.dataset.zone), "structure");
-  assert.match(await page.locator("#ws-title").textContent(), /Extração e normalização/);
-  assert.match(await page.locator(".ex-case").textContent(), /nunca são alterados/);
+  assert.equal(await page.locator("#e-groups .e-group").count(), 2);
+  assert.equal(await page.locator("#ex-adv").isHidden(), true, "the simple mode is the default");
+  // Little text: no hint paragraphs, explanations live behind the info icons.
+  assert.ok((await page.locator("#ex-easy").innerText()).length < 700, "the simple view stays almost wordless");
+  await page.screenshot({ path: "output/playwright/extraction-easy-start.png", fullPage: true });
 
-  // Samples: strategy and distribution are shown, the rare shape is flagged.
-  await page.getByRole("button", { name: /Sortear amostras/ }).click();
-  await page.waitForFunction(() => document.querySelectorAll("#ex-sample-list .ex-sample").length === 3);
-  assert.match(await page.locator(".ex-strategy").textContent(), /Amostra estratificada/);
-  assert.match(await page.locator("#ex-sample-list").textContent(), /formato raro/);
-  assert.match(await page.locator("#ex-suggest").textContent(), /2 de 3 amostras/);
-  assert.equal(await page.locator("[data-sel]").first().isDisabled(), true, "actions need a selection");
+  // 1. A ready-made format is offered and creates the columns in one click.
+  assert.match(await page.locator("#e-suggest").textContent(), /acesso HTTP/);
+  await page.click("#e-use");
+  await page.waitForFunction(() => document.querySelectorAll("#e-table th").length >= 4);
+  assert.deepEqual((await cols()).slice(0, 2), ["cliente", "usuario"]);
+  assert.match(await page.locator("#e-cov").textContent(), /^\d+(?:\.\d)?%$/);
 
-  // Select "ana" and extract it: the pattern is written to the definition and the chips follow.
+  // 2. A second type is taught from its example line by clicking the underlined pieces.
+  await page.click('[data-e-group="gbbbb"]');
+  await page.waitForFunction(() => document.querySelectorAll("#e-line .e-chip").length >= 3);
+  const chips = await page.locator("#e-line .e-chip").allTextContents();
+  assert.ok(chips.includes("10.0.0.5") && chips.includes("ana") && chips.includes("12.5"), `${chips}`);
+  assert.equal(await page.locator("#e-line .e-chip", { hasText: "12.5" }).count(), 1, "the unit stays out of the number");
+  await page.locator("#e-line .e-chip", { hasText: "ana" }).click();
+  await page.locator("#e-line .e-chip", { hasText: "12.5" }).click();
+  await page.waitForFunction(() => document.querySelectorAll("#e-table th").length === 2);
+  assert.deepEqual(await cols(), ["usuario", "duracao"]);
+  assert.equal(await page.evaluate(() => Extraction.state.def.rules.find((r) => r.id === "gbbbb").fields.duracao.type), "decimal");
+  // The expression is written from the line and reaches the definition; the table values come from the engine.
+  const pattern = await page.evaluate(() => Extraction.state.def.rules.find((r) => r.id === "gbbbb").extract.patterns[0]);
+  assert.match(pattern, /usuario=%\{NOTSPACE:usuario\} ip=\S*|%\{NOTSPACE:usuario\}/);
+  assert.equal(await page.locator("#e-table td.bad").count(), 1, "12,5 is not a decimal");
+  assert.equal(await page.locator("#e-left").isVisible(), true, "the unrecognized line is flagged");
+  assert.match(await page.locator("#e-left").textContent(), /1/);
+
+  // 3. Right-click on a selection: a short, contextual menu.
   await page.evaluate(() => {
-    const node = document.querySelector("#ex-sample-list .ex-sample-text").firstChild;
-    const at = node.textContent.indexOf("ana");
-    getSelection().setBaseAndExtent(node, at, node, at + 3);
+    const walker = document.createTreeWalker(document.querySelector("#e-line"), NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) if (n.textContent.includes("10.0.0.5")) break;
+    const i = n.textContent.indexOf("10.0.0.5");
+    getSelection().setBaseAndExtent(n, i, n, i + 8);
   });
-  await page.waitForFunction(() => !document.querySelector('[data-sel="extract"]').disabled);
-  await page.locator('[data-sel="extract"]').click();
-  await page.waitForFunction(() => document.querySelector("[data-grok]")?.value.includes("%{WORD:usuario}"));
-  assert.equal(await page.locator(".ex-alt .ex-chip").count(), 1);
-  await page.waitForFunction(() => document.querySelector("#ex-right-body")?.textContent.includes("Prévia rápida"));
-  await page.waitForSelector("#ex-sample-list .ex-mark");
-  const color = await page.locator("#ex-sample-list .ex-mark").first().evaluate((n) => n.style.getPropertyValue("--c"));
-  assert.match(color, /^#[0-9a-f]{6}$/i);
-  assert.match(await page.locator(".ex-values").textContent(), /usuario/);
-  assert.equal(await page.evaluate(() => Extraction.state.def.rules[0].fields.usuario.from[0]), "usuario");
+  const box = await page.evaluate(() => { const r = getSelection().getRangeAt(0).getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; });
+  await page.mouse.click(box.x, box.y, { button: "right" });
+  await page.waitForSelector("#e-menu:not([hidden])");
+  const items = await page.locator("#e-menu button span").allTextContents();
+  assert.ok(items[0].startsWith("Coluna") && items.includes("Ignorar") && items.includes("Entre marcadores…"), `${items}`);
+  await page.locator("#e-menu button").first().click();
+  await page.waitForFunction(() => document.querySelectorAll("#e-table th").length === 3);
 
-  // One source of truth: the JSON tab shows the same definition, and bad text is refused with a diagnostic.
-  await page.getByRole("tab", { name: "Definição" }).click();
-  assert.match(await page.locator("#ex-json").inputValue(), /%\{WORD:usuario\}/);
-  await page.locator("#ex-json").fill("{ not json");
-  await page.locator('[data-act="json-apply"]').click();
-  assert.match(await page.locator("#ex-json-msg").textContent(), /recusado/);
-  await page.evaluate(() => { Extraction.state.def.rules[0].extract.patterns[0] += " %{NOPE:x}"; });
-  await page.locator("[data-grok]").fill("usuario=%{WORD:usuario} %{NOPE:x}");
-  await page.waitForSelector(".ex-diag");
-  assert.match(await page.locator(".ex-diag").textContent(), /NOPE/);
-  assert.equal(await page.locator('[data-act="ex-save"]').isDisabled(), true, "an invalid definition cannot be saved");
-  await page.locator("[data-grok]").fill("usuario=%{WORD:usuario}");
-  await page.waitForFunction(() => !document.querySelector(".ex-diag"));
+  // 4. Header menu: rename through a small dialog, type through another.
+  await page.locator("#e-table th").nth(2).click();
+  await page.waitForSelector("#e-menu:not([hidden])");
+  assert.ok((await page.locator("#e-menu").innerText()).includes("Renomear"));
+  await page.locator("#e-menu button", { hasText: "Renomear" }).click();
+  await page.locator("#e-dlg input[name=name]").fill("origem");
+  await page.locator("#e-dlg button[value=ok]").click();
+  await page.waitForFunction(() => [...document.querySelectorAll("#e-table th")].some((t) => t.dataset.eCol === "origem"));
+  await page.locator("#e-table th", { hasText: "usuario" }).click({ button: "right" });
+  await page.locator("#e-menu button", { hasText: "Minúsculas" }).click();
+  assert.deepEqual(await page.evaluate(() => Extraction.state.def.rules.find((r) => r.id === "gbbbb").fields.usuario.steps), [{ op: "lowercase" }]);
 
-  // Undo and redo walk the history; the draft is kept apart in the Case preferences.
-  await page.locator('[data-act="undo"]').click();
-  assert.match(await page.locator("[data-grok]").inputValue(), /NOPE|%\{WORD:usuario\}/);
-  assert.ok(await page.evaluate(() => Object.keys(LocalExplorer.extraction().drafts).length >= 1));
-  await page.locator('[data-act="redo"]').click();
+  // 5. Cell menu on the invalid value offers the fix and applies it as a normalization step.
+  await page.locator("#e-table td.bad").click({ button: "right" });
+  await page.waitForSelector("#e-menu:not([hidden])");
+  assert.match(await page.locator("#e-menu").innerText(), /não é um decimal/);
+  await page.locator("#e-menu button", { hasText: "Trocar vírgula por ponto" }).click();
+  await page.waitForFunction(() => document.querySelectorAll("#e-table td.bad").length === 0);
 
-  // Complete verification is a separate, explicit scope.
-  await page.getByRole("tab", { name: "Conjunto completo" }).click();
-  await page.locator('[data-act="scan"]').click();
-  await page.waitForFunction(() => document.querySelector("#ex-right-body")?.textContent.includes("Contagem completa"));
-  assert.match(await page.locator("#ex-right-body").textContent(), /118\.000/);
-  assert.match(await page.locator("#ex-right-body").textContent(), /Exemplos que falharam/);
+  // 6. Undo walks back through the one shared history.
+  await page.locator("#e-undo").click();
+  await page.waitForFunction(() => document.querySelectorAll("#e-table td.bad").length === 1);
+  await page.locator("#e-redo").click();
+  await page.waitForFunction(() => document.querySelectorAll("#e-table td.bad").length === 0);
 
-  // Effect of the edit, then save.
-  await page.getByRole("tab", { name: "Efeito da edição" }).click();
-  await page.locator('[data-act="diff"]').click();
-  await page.waitForFunction(() => document.querySelector("#ex-right-body")?.textContent.includes("Campos novos"));
-  await page.locator("#ex-name").fill("norm");
-  await page.locator("#ex-name").dispatchEvent("change");
-  await page.locator('[data-act="ex-save"]').click();
+  // 7. A line that was left out is taught as a type of its own.
+  await page.locator("#e-left").click();
+  await page.waitForSelector("#e-pop li");
+  await page.locator("#e-pop [data-teach]").click();
+  await page.waitForFunction(() => document.querySelectorAll("#e-groups .e-group").length === 3);
+  assert.match(await page.locator("#e-line").textContent(), /fora do formato/);
+
+  // 8. Information lives behind the small icon, in a modal.
+  await page.locator('[data-e-info="cobertura"]').click();
+  assert.match(await page.locator("#e-dlg").textContent(), /estimativa/i);
+  await page.keyboard.press("Escape");
+
+  // 9. Apply: summary, then the map is saved in the Case through the same save as the advanced mode.
+  await page.click("#e-apply");
+  await page.waitForSelector("#e-dlg[open]");
+  assert.match(await page.locator("#e-dlg").textContent(), /norm\.usuario/);
+  await page.locator("#e-dlg button[value=ok]").click();
   await page.waitForFunction(() => window.__calls.some((c) => c.action === "save_map"));
   const saved = await page.evaluate(() => window.__calls.find((c) => c.action === "save_map"));
   assert.equal(saved.name, "norm");
-  assert.match(saved.map_json, /WORD:usuario/);
+  assert.match(saved.map_json, /%\{NOTSPACE:usuario\}/);
+  assert.match(saved.map_json, /"easy"/, "the example line and its marks travel with the definition");
 
-  // Templates load as drafts and are tried on their own example lines, with no source needed.
-  await page.getByRole("tab", { name: "Modelos" }).click();
-  await page.locator('[data-act="template"]').click();
-  await page.waitForFunction(() => document.querySelector("#ex-right-body")?.textContent.includes("Prévia rápida"));
+  // 10. The advanced mode is the same definition, one click away, and comes back.
+  await page.click("#e-adv");
+  await page.waitForSelector("#ex-adv:not([hidden])");
+  assert.equal(await page.locator("#ex-easy").isHidden(), true);
+  await page.locator('[data-act="view-easy"]').click();
+  await page.waitForSelector("#ex-easy:not([hidden]) #e-groups .e-group");
 
-  // Layout: no horizontal overflow, light and dark, wide and narrow.
+  // 11. Layout: no horizontal overflow in both themes and widths.
   for (const width of [1440, 1024, 390]) {
     await page.setViewportSize({ width, height: 900 });
     for (const theme of ["light", "dark"]) {
       await page.evaluate((t) => (document.documentElement.dataset.theme = t), theme);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `${theme} ${width}px`);
-      if (width !== 390) await page.screenshot({ path: `output/playwright/extraction-${theme}-${width}.png`, fullPage: true });
+      if (width !== 390) await page.screenshot({ path: `output/playwright/extraction-easy-${theme}-${width}.png`, fullPage: true });
     }
   }
   assert.deepEqual(errors, []);
-  console.log("Extração e normalização: navigation, samples, visual extraction, single source of truth, diagnostics, undo, full scan, diff, save, templates and responsive layout passed (mock presentation).");
+  console.log("Extração e normalização (modo simples): grupos, formato conhecido, etiquetas, menu de seleção, cabeçalho, célula, desfazer, sobras, ajuda em modal, aplicar, avançado e layout passaram (apresentação simulada).");
 } finally {
   await browser.close();
 }

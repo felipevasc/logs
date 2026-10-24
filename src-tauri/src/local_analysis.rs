@@ -90,6 +90,12 @@ pub(crate) enum Request {
         field: Option<String>,
         seed: Option<u64>,
     },
+    /// Records grouped by how their lines look, with the ready-made format each fits.
+    MapGroups {
+        sources: Option<Vec<String>>,
+        field: Option<String>,
+        seed: Option<u64>,
+    },
     MapSuggest {
         texts: Vec<String>,
     },
@@ -549,6 +555,15 @@ fn execute(state: &AppState, request: Request, filters: &[Filter]) -> Result<Val
             crate::map_lab::SampleRequest {
                 sources,
                 count,
+                field,
+                seed,
+            },
+        ),
+        Request::MapGroups { sources, field, seed } => crate::map_lab::groups(
+            state,
+            crate::map_lab::SampleRequest {
+                sources,
+                count: None,
                 field,
                 seed,
             },

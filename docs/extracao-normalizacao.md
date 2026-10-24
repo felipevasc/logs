@@ -35,7 +35,35 @@ são emitidos como texto para não perder dígitos. Datas exigem formato e fuso 
 Alterar título, notas, cores ou preferências de índice **não** invalida caches nem
 índices; alterar qualquer coisa que muda um valor, sim (assinatura semântica).
 
-## Fluxo com amostras reais
+## Modo simples (padrão)
+
+A página abre no **modo simples**, pensado para ensinar pelo exemplo, com quase nenhum texto: as
+explicações ficam atrás de um ícone ⓘ que abre um modal.
+
+- **Tipos de linha** (à esquerda): o motor sorteia amostras de todas as fontes e as agrupa pela
+  aparência. Cada tipo mostra um anel com a cobertura e, quando se encaixa num formato pronto (acesso
+  HTTP, chave=valor, JSON, CSV…), oferece “Usar este formato”. Botão direito no tipo: renomear ou
+  recomeçar.
+- **Linha de exemplo**: os pedaços que o motor reconheceu (IP, datas, valores de `chave=valor`, com a
+  unidade e as aspas de fora) aparecem sublinhados. Um clique vira coluna; outro clique ignora.
+  Qualquer trecho selecionado abre, com o botão direito, um menu curto: coluna, o que vem depois/antes,
+  entre marcadores, ignorar, texto fixo, permitir variação, opcional, separar por delimitador.
+  Reconhecidos entre colunas (um IP no meio da linha) viram padrões e não o texto daquela linha.
+- **Tabela ao vivo**: calculada pelo motor nativo sobre as amostras. Cabeçalho: renomear, tipo (data
+  pede formato e fuso), normalizações (minúsculas, sem espaços, só o nome do arquivo, hex→decimal),
+  valores frequentes, criar índice, duplicar, remover. Célula: copiar, ver na linha e, quando a
+  conversão falha, o motivo e o conserto (“trocar vírgula por ponto”).
+- **Cobertura e sobras**: estimativa sobre as amostras do tipo (a contagem completa está em
+  “Conferir no conjunto”, no diálogo de aplicar). O selo vermelho lista as linhas que sobraram; cada
+  uma pode ser ensinada como um tipo próprio.
+- **Aplicar**: resume os campos, deixa conferir no conjunto e salva no Caso. Desfazer/refazer e os
+  rascunhos são os mesmos do modo avançado.
+
+O modo simples escreve na mesma definição: a linha de exemplo e as marcações ficam em
+`ui.easy` da definição, para reabrir e continuar editando. Regras criadas no modo avançado aparecem
+como “+N” e só se editam lá. O botão `</>` abre o **modo avançado**, com tudo que existia antes.
+
+## Modo avançado: fluxo com amostras reais
 
 1. **Sortear amostras**: amostra estratificada e repetível (mesma semente, mesmas
    amostras) de todos os arquivos abertos; cerca de 70% seguem os formatos predominantes

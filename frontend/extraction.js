@@ -23,7 +23,7 @@ window.Extraction = (() => {
   let root = null, generation = 0, ownerKey = "", timers = {};
   const S = {
     name: "norm", installed: null, base: "", def: null, ruleId: null, samples: null, active: 0, segs: {}, quick: null, scan: null, diff: null,
-    suggest: null, catalog: null, tab: "quick", index: null, serial: { quick: 0, check: 0, scan: 0 }, hist: new M.History(), texts: [], selection: null,
+    view: "easy", suggest: null, catalog: null, tab: "quick", index: null, serial: { quick: 0, check: 0, scan: 0 }, hist: new M.History(), texts: [], selection: null,
     diagnostics: [], outputs: [], valid: true, error: "", notice: "", noticeError: false, chip: null, sources: [], pickedSources: null, building: null, json: "",
   };
   const prefs = () => window.LocalExplorer.extraction();
@@ -56,7 +56,7 @@ window.Extraction = (() => {
   }
   function commit() {
     S.hist.push(text()); S.json = text();
-    saveDraft(); refreshDerived(); paintHeader(); paintResultsHeader();
+    saveDraft(); refreshDerived(); paintHeader(); paintResultsHeader(); S.onChange?.();
   }
   function saveDraft() {
     const key = S.installed || "__novo__";
@@ -189,6 +189,7 @@ window.Extraction = (() => {
       <label class="ex-grow">Mapa do Caso<select id="ex-installed"><option value="">Novo mapa</option>${installed.map((d) => `<option value="${h(d.name)}" ${d.name === S.installed ? "selected" : ""}>${h(d.name)} · ${h(d.advanced.map.title)}${d.advanced.map.enabled === false ? " (desativado)" : ""}</option>`).join("")}</select></label>
       <label>Nome do campo<input id="ex-name" value="${h(S.name)}" maxlength="256" aria-describedby="ex-name-help"></label>
       <span class="ex-pending" ${pending ? "" : "hidden"} role="status"><i class="fas fa-circle" aria-hidden="true"></i> Alterações não salvas</span>
+      <button type="button" class="btn ghost small" data-act="view-easy"><i class="fas fa-wand-magic-sparkles" aria-hidden="true"></i> Modo simples</button>
       <button type="button" class="btn ghost small" data-act="undo" ${S.hist.canUndo ? "" : "disabled"} title="Desfazer (Ctrl+Z)"><i class="fas fa-rotate-left" aria-hidden="true"></i> Desfazer</button>
       <button type="button" class="btn ghost small" data-act="redo" ${S.hist.canRedo ? "" : "disabled"} title="Refazer (Ctrl+Y)"><i class="fas fa-rotate-right" aria-hidden="true"></i> Refazer</button>
       <button type="button" class="btn primary small" data-act="ex-save" ${S.valid && pending ? "" : "disabled"}><i class="fas fa-floppy-disk" aria-hidden="true"></i> Salvar no Caso</button>
@@ -534,7 +535,7 @@ window.Extraction = (() => {
   }
   // Leaving a field first lets its pending change land, so it cannot overwrite the restored text.
   function travel(direction) { document.activeElement?.blur?.(); applyHistory(S.hist[direction]()); }
-  function applyHistory(value) { if (value == null) return; S.def = JSON.parse(value); S.json = value; if (!rule()) S.ruleId = S.def.rules[0]?.id ?? null; saveDraft(); refreshDerived(); paintAll(); }
+  function applyHistory(value) { if (value == null) return; S.def = JSON.parse(value); S.json = value; if (!rule()) S.ruleId = S.def.rules[0]?.id ?? null; saveDraft(); refreshDerived(); paintAll(); S.onChange?.(); }
   /** Renames a key of an object inside the definition, keeping the order of the others. */
   function renameField(path, oldKey, value) {
     let t = S.def;
@@ -560,6 +561,7 @@ window.Extraction = (() => {
     const d = t.dataset, r = rule(), ri = ruleIndex();
     const mutate = (fn) => { fn(); commit(); paintCenter(); };
     switch (d.act) {
+      case "view-easy": setView("easy"); break;
       case "undo": travel("undo"); break;
       case "redo": travel("redo"); break;
       case "ex-save": await save(); break;
@@ -723,7 +725,7 @@ window.Extraction = (() => {
     const switched = !S.def || (ownerKey && ownerKey !== current);
     if (switched) { S.samples = null; S.quick = null; S.scan = null; S.diff = null; S.texts = []; S.segs = {}; S.pickedSources = null; S.index = null; S.suggest = null; }
     ownerKey = current;
-    root.innerHTML = `<section class="ex" aria-label="Extração e normalização"><div id="ex-head" class="ex-head"></div><div class="ex-grid"><section id="ex-left" class="lx-pane ex-pane" aria-label="Amostras"></section><section id="ex-center" class="lx-pane ex-pane" aria-label="Regras e saídas"></section><section class="lx-pane ex-pane" aria-label="Resultado e verificação"><header><h2>3 · Resultado e verificação</h2></header><div id="ex-tabs" class="ex-tabs" role="tablist"></div><div id="ex-right-body" class="ex-right"></div></section></div></section>`;
+    root.innerHTML = `<div id="ex-easy" class="exe" ${S.view === "adv" ? "hidden" : ""}></div><section class="ex" id="ex-adv" ${S.view === "adv" ? "" : "hidden"} aria-label="Extração e normalização — avançado"><div id="ex-head" class="ex-head"></div><div class="ex-grid"><section id="ex-left" class="lx-pane ex-pane" aria-label="Amostras"></section><section id="ex-center" class="lx-pane ex-pane" aria-label="Regras e saídas"></section><section class="lx-pane ex-pane" aria-label="Resultado e verificação"><header><h2>3 · Resultado e verificação</h2></header><div id="ex-tabs" class="ex-tabs" role="tablist"></div><div id="ex-right-body" class="ex-right"></div></section></div></section>`;
     const g = generation;
     root.onclick = onClick; root.onchange = onChange; root.oninput = onInput; root.onsubmit = onSubmit; root.oncontextmenu = onContext; root.onkeydown = onKey;
     document.removeEventListener("selectionchange", onSelect);
@@ -739,6 +741,7 @@ window.Extraction = (() => {
       loadInstalled(wanted && installedMaps().some((d) => d.name === wanted) ? wanted : installedMaps()[0]?.name ?? null);
     }
     paintAll();
+    window.ExtractionEasy?.mount($("#ex-easy"), core);
     void check(); void refreshIndexes();
     call({ action: "map_catalog" }, { latest: "map-catalog" }).then((c) => { if (alive(g)) { S.catalog = c; paintCenter(); if (S.tab === "templates") paintRight(); } }).catch(() => {});
     if (S.samples || S.texts.length) void evaluateQuick();
@@ -747,8 +750,17 @@ window.Extraction = (() => {
     document.removeEventListener("selectionchange", onSelect);
     window.LocalNative.cancel("map-sample"); window.LocalNative.cancel("map-quick");
     Object.values(timers).forEach(clearTimeout); timers = {};
+    window.ExtractionEasy?.unmount?.();
     root = null; generation++;
   }
+  function setView(view) {
+    S.view = view;
+    const easy = q("#ex-easy"), adv = q("#ex-adv");
+    if (!easy || !adv) return;
+    easy.hidden = view !== "easy"; adv.hidden = view !== "adv";
+    if (view === "adv") { paintAll(); void check(); } else window.ExtractionEasy?.refresh?.();
+  }
+  const core = { S, M, call, alive: () => alive(generation), text, commit, save, check, scan, computeDiff, installedMaps, say, paintHeader, setView, refreshIndexes, saveDraft, loadInstalled, get generation() { return generation; }, get root() { return root; } };
   document.addEventListener("analysis-context-change", () => { if (root && ownerKey && ownerKey !== window.LocalNative.stamp()) void mount(root); });
-  return { mount, unmount, state: S, _model: M };
+  return { mount, unmount, state: S, _model: M, core };
 })();

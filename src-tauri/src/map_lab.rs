@@ -228,6 +228,89 @@ pub(crate) fn sample(state: &AppState, request: SampleRequest) -> Result<Value, 
     }))
 }
 
+// ------------------------------------------------------------------ line types
+fn fnv(text: &str) -> u32 {
+    text.bytes().fold(2166136261u32, |h, b| (h ^ u32::from(b)).wrapping_mul(16777619))
+}
+/// The loaded records grouped by how their lines look, so each kind of line is taught once.
+/// Every group names the ready-made format it fits (when one does), says how many records
+/// of the source it stands for (an estimate from the draw) and carries its sample lines.
+pub(crate) fn groups(state: &AppState, mut request: SampleRequest) -> Result<Value, String> {
+    request.count = Some(MAX_SAMPLES);
+    let drawn = sample(state, request)?;
+    let samples = drawn["samples"].as_array().cloned().unwrap_or_default();
+    let population = drawn["population"].as_f64().unwrap_or(0.0);
+    let examined = drawn["examined"].as_f64().unwrap_or(1.0).max(1.0);
+    struct Group {
+        key: String,
+        pool: f64,
+        shapes: BTreeSet<String>,
+        items: Vec<Value>,
+    }
+    let mut by_key: BTreeMap<String, Group> = BTreeMap::new();
+    for s in &samples {
+        let shape = s["shape"].as_str().unwrap_or("");
+        let key: String = shape.chars().take(24).collect();
+        let g = by_key.entry(key.clone()).or_insert_with(|| Group { key, pool: 0.0, shapes: BTreeSet::new(), items: Vec::new() });
+        if g.shapes.insert(shape.to_owned()) {
+            g.pool += s["shapeCount"].as_f64().unwrap_or(1.0);
+        }
+        g.items.push(s.clone());
+    }
+    let mut ordered: Vec<Group> = by_key.into_values().collect();
+    ordered.sort_by(|a, b| b.pool.total_cmp(&a.pool).then(a.key.cmp(&b.key)));
+    // At most six named types; whatever is left over is one "Outras" group.
+    if ordered.len() > 6 {
+        let rest: Vec<Group> = ordered.split_off(5);
+        let mut other = Group { key: "outras".into(), pool: 0.0, shapes: BTreeSet::new(), items: Vec::new() };
+        for g in rest {
+            other.pool += g.pool;
+            other.items.extend(g.items);
+        }
+        other.items.truncate(MAX_SAMPLES);
+        ordered.push(other);
+    }
+    let templates: Vec<(crate::map_templates::Template, Option<std::sync::Arc<Compiled>>)> = crate::map_templates::all()
+        .into_iter()
+        .filter(|t| t.map.rules.iter().any(|r| r.extract.is_some()))
+        .map(|t| {
+            let compiled = Compiled::new(t.map.clone()).ok();
+            (t, compiled)
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (n, g) in ordered.into_iter().enumerate() {
+        crate::operations::check()?;
+        let mut known: Option<Value> = None;
+        let mut best = 0.0f64;
+        for (t, compiled) in &templates {
+            let Some(compiled) = compiled else { continue };
+            let hits = g
+                .items
+                .iter()
+                .filter(|s| {
+                    let mut event = crate::model::Event::empty();
+                    let text = s["text"].as_str().unwrap_or("");
+                    event.message = text.to_owned();
+                    event.raw = text.to_owned();
+                    let mut trace = Trace::default();
+                    let _ = compiled.evaluate(&event, Some(&mut trace));
+                    trace.rules.iter().any(|r| r.extraction == "recognized")
+                })
+                .count() as f64;
+            let ratio = hits / g.items.len().max(1) as f64;
+            if ratio >= 0.8 && ratio > best {
+                best = ratio;
+                known = Some(json!({"id":t.id,"title":t.title,"description":t.description,"ratio":ratio,"map":t.map}));
+            }
+        }
+        let id = format!("g{:08x}", fnv(&g.key));
+        let name = known.as_ref().and_then(|k| k["title"].as_str()).map_or_else(|| format!("Tipo {}", n + 1), str::to_owned);
+        out.push(json!({"id":id,"name":name,"known":known,"pool":g.pool,"population":(g.pool / examined * population).round(),"samples":g.items}));
+    }
+    Ok(json!({"population":drawn["population"],"examined":drawn["examined"],"field":drawn["field"],"seed":drawn["seed"],"groups":out}))
+}
+
 // ------------------------------------------------------------------ evaluation
 fn parse_map(map_json: &str) -> Result<enrichment_maps::Definition, String> {
     if map_json.len() > 256 << 10 {
@@ -648,11 +731,35 @@ pub(crate) fn suggest(texts: &[String]) -> Result<Value, String> {
     }
     // key=value pairs: one proposal per key, plus a ready extraction.
     let mut keys: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
-    for text in texts {
+    // Where each key's value sits in each text, as a Grok pattern could capture it: quotes are
+    // left out, and a unit glued to a number (12.5ms) is left out of the number.
+    let mut places: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut shapes_of: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+    for (i, text) in texts.iter().enumerate() {
         let mut seen = BTreeSet::new();
         for c in KV.captures_iter(text) {
             let key = c[1].to_owned();
+            let whole = c.get(2).expect("value group");
             let value = c[2].trim_matches('"').chars().take(60).collect::<String>();
+            let (mut start, mut end) = (whole.start(), whole.end());
+            let quoted = whole.as_str().starts_with('"');
+            if quoted {
+                start += 1;
+                end = end.saturating_sub(usize::from(whole.as_str().len() > 1 && whole.as_str().ends_with('"')));
+            }
+            let raw = &text[start..end];
+            let digits = raw.bytes().take_while(|b| b.is_ascii_digit() || *b == b'.' || *b == b'-').count();
+            let numeric = &raw[..digits];
+            let number = !quoted && !numeric.is_empty() && numeric.bytes().any(|b| b.is_ascii_digit()) && numeric.matches('.').count() <= 1 && !numeric.ends_with('.') && !numeric.starts_with('.') && raw[digits..].bytes().all(|b| b.is_ascii_alphabetic() || b == b'%');
+            if number {
+                end = start + digits;
+            }
+            let kind = if number { if numeric.contains('.') { "NUMBER" } else { "INT" } } else if quoted { "DATA" } else { "NOTSPACE" };
+            shapes_of.entry(key.clone()).or_default().insert(kind);
+            let list = places.entry(key.clone()).or_default();
+            if list.len() < 600 {
+                list.push(json!({"sample":i,"start":utf16(text, start),"end":utf16(text, end)}));
+            }
             let entry = keys.entry(key.clone()).or_default();
             if seen.insert(key) {
                 entry.0 += 1;
@@ -664,7 +771,14 @@ pub(crate) fn suggest(texts: &[String]) -> Result<Value, String> {
     let mut extractions = Vec::new();
     if !keys.is_empty() {
         for (key, (n, values)) in &keys {
+            // A key whose values mix shapes is captured as plain text.
+            let expression = match shapes_of.get(key).map(|s| s.iter().copied().collect::<Vec<_>>()).as_deref() {
+                Some([one]) => *one,
+                Some(many) if many.iter().all(|k| matches!(*k, "INT" | "NUMBER")) => "NUMBER",
+                _ => "NOTSPACE",
+            };
             suggestions.push(json!({"id":format!("kv:{key}"),"kind":"key_value","label":format!("Valor de {key}="),"why":"Par chave=valor recorrente.","key":key,"field":output_name(key),"found":n,"total":total,"examples":examples(values),
+                "expression": expression, "positions": places.get(key).cloned().unwrap_or_default(),
                 "message": format!("A chave {key}= aparece em {n} de {total} amostras.")}));
         }
         extractions.push(json!({"id":"key_value","label":"Pares chave=valor","explanation":"Lê as chaves reconhecidas respeitando aspas.","found":keys.values().map(|k| k.0).max().unwrap_or(0),"total":total,
@@ -778,6 +892,22 @@ mod tests {
         assert!(none["suggestions"].as_array().unwrap().iter().all(|x| x["id"] != "ip"));
     }
     #[test]
+    fn key_value_proposals_say_where_each_value_sits_and_leave_units_and_quotes_out() {
+        let texts: Vec<String> = (0..4).map(|i| format!("ok usuario=u{i} duracao={i}.5ms nome=\"ana silva\" total={i}")).collect();
+        let r = suggest(&texts).unwrap();
+        let find = |key: &str| r["suggestions"].as_array().unwrap().iter().find(|s| s["id"] == format!("kv:{key}")).unwrap().clone();
+        let duration = find("duracao");
+        assert_eq!(duration["expression"], "NUMBER");
+        let at = &duration["positions"][0];
+        assert_eq!(&texts[0][at["start"].as_u64().unwrap() as usize..at["end"].as_u64().unwrap() as usize], "0.5", "the unit stays out");
+        assert_eq!(find("total")["expression"], "INT");
+        let quoted = find("nome");
+        assert_eq!(quoted["expression"], "DATA");
+        let at = &quoted["positions"][0];
+        assert_eq!(&texts[0][at["start"].as_u64().unwrap() as usize..at["end"].as_u64().unwrap() as usize], "ana silva");
+        assert_eq!(find("usuario")["expression"], "NOTSPACE");
+    }
+    #[test]
     fn structured_data_gets_structured_proposals() {
         let json_lines: Vec<String> = (0..6).map(|i| format!("{{\"user\":{{\"name\":\"u{i}\"}},\"n\":{i}}}")).collect();
         let r = suggest(&json_lines).unwrap();
@@ -867,6 +997,13 @@ mod tests {
             assert!(done["failures"][0]["text"].is_string());
             // A source filter narrows the sample to one file.
             let only_b = sample(&state, SampleRequest { sources: Some(vec![paths[1].clone()]), count: Some(10), field: None, seed: None }).unwrap();
+            // Line types: each file's format is its own group, the matching ready-made format is named.
+            let typed = groups(&state, SampleRequest { sources: None, count: None, field: None, seed: Some(7) }).unwrap();
+            let names: Vec<(String, bool)> = typed["groups"].as_array().unwrap().iter().map(|g| (g["name"].as_str().unwrap().to_owned(), g["known"].is_object())).collect();
+            assert!(typed["groups"].as_array().unwrap().len() >= 2, "{names:?}");
+            assert!(typed["groups"].as_array().unwrap().iter().any(|g| g["known"]["id"] == "ip-usuario-acao-duracao"), "{names:?}");
+            assert!(typed["groups"].as_array().unwrap().iter().all(|g| g["id"].as_str().unwrap().starts_with('g') && !g["samples"].as_array().unwrap().is_empty()));
+            assert!(typed["groups"].as_array().unwrap().iter().map(|g| g["population"].as_f64().unwrap()).sum::<f64>() > 0.0);
             assert!(only_b["samples"].as_array().unwrap().iter().all(|s| s["file"] == paths[1].as_str()));
         });
     }

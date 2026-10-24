@@ -26,7 +26,7 @@ for (const item of [
   "log-split.js", "log-split.css",
   "local-native.js", "local-explorer.js", "local-explorer.css", "file-viewer.js",
   "regex-syntax.js", "regex-editor.js", "regex-editor.css", "regex-assist.js", "regex-workbench.js",
-  "event-context.js", "event-pattern-search.js", "field-extraction.js", "extraction-model.js", "extraction.js", "extraction.css",
+  "event-context.js", "event-pattern-search.js", "field-extraction.js", "extraction-model.js", "extraction-easy.js", "extraction-easy.css", "extraction.js", "extraction.css",
 ]) {
   cpSync(resolve(source, item), resolve(output, item), { recursive: true });
 }
