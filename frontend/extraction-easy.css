@@ -76,6 +76,7 @@
 .e-empty { display: grid; place-items: center; padding: 26px; color: var(--e-muted); }
 .e-empty svg { width: 22px; height: 22px; }
 .e-error { color: var(--e-bad); }
+.e-error[data-note="true"] { color: var(--e-muted); }
 .e-menu { position: fixed; z-index: 400; min-width: 250px; max-width: 340px; background: var(--e-panel); border: 1px solid var(--e-line); border-radius: 12px; box-shadow: 0 10px 30px rgba(0, 0, 0, .35); padding: 5px; }
 .e-menu[hidden], .e-pop[hidden], .e-toast[hidden] { display: none; }
 .e-mt { font-size: 11px; color: var(--e-muted); padding: 5px 10px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

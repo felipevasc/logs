@@ -147,7 +147,7 @@ window.Extraction = (() => {
   async function computeDiff() {
     const g = generation;
     const prefix = S.name;
-    const status = await call({ action: "map_diff", map_json: text(), current_json: S.base || null, prefix, indexed: (S.index?.indexes || []).map((i) => i.field) }, { latest: "map-diff" });
+    const status = await call({ action: "map_diff", map_json: text(), current_json: S.installed && S.installed === prefix ? S.base || null : null, prefix, indexed: (S.index?.indexes || []).map((i) => i.field) }, { latest: "map-diff" });
     if (alive(g)) S.diff = status;
     return status;
   }
@@ -159,19 +159,23 @@ window.Extraction = (() => {
     } catch { if (alive(g)) S.index = null; }
   }
   async function save() {
-    if (!S.valid) { say(S.error || "Corrija os problemas antes de salvar.", true); return; }
-    const name = (q("#ex-name").value || "").trim();
-    if (!name) { say("Informe o nome do campo que recebe os valores (por exemplo, norm).", true); return; }
-    const g = generation;
+    if (S.defsReady === false) { say("As definições do Caso ainda não carregaram. Tente de novo em instantes.", true); return false; }
+    if (!S.valid) { say(S.error || "Corrija os problemas antes de salvar.", true); return false; }
+    const name = ((q("#ex-name")?.value ?? S.name) || "").trim();
+    if (!name) { say("Informe o nome do campo que recebe os valores (por exemplo, norm).", true); return false; }
+    // The page may be reopened while this runs (the Case revision changes); the save itself goes on.
     const diff = await computeDiff();
-    if (!alive(g)) return;
-    if (diff.indexesToRebuild?.length && !confirm(`Esta alteração invalida ${diff.indexesToRebuild.length} índice(s): ${diff.indexesToRebuild.join(", ")}. Eles voltam a ser usados depois de recriados. Salvar mesmo assim?`)) return;
+    if (diff.indexesToRebuild?.length && !confirm(`Esta alteração invalida ${diff.indexesToRebuild.length} índice(s): ${diff.indexesToRebuild.join(", ")}. Eles voltam a ser usados depois de recriados. Salvar mesmo assim?`)) return false;
     await call({ action: "save_map", name, map_json: text() }, { latest: "local-save" });
     await loadDerivedFields();
     S.installed = name; S.name = name; S.base = JSON.stringify(S.def); dropDraft("__novo__"); dropDraft(name);
+    // Reopening the page (the Case revision just changed) must land on the map that was saved.
+    prefs().current = name; window.LocalExplorer.keep();
     S.diff = null; S.hist.reset(text());
     say(`Mapa salvo no Caso como “${name}”. Filtros, SQL e árvores de processos usam os novos campos.`);
-    paintAll(); void refreshIndexes();
+    try { paintAll(); } catch (e) { console.error("extraction advanced view", e); }
+    void refreshIndexes();
+    return true;
   }
 
   // ------------------------------------------------------------------ rendering: header
@@ -736,13 +740,35 @@ window.Extraction = (() => {
     S.ready = new Promise((resolve) => { ready = resolve; });
     S.fatal = null;
     window.ExtractionEasy?.mount($("#ex-easy"), core);
+    // Each step is bounded: a Case that is busy elsewhere must not keep this page waiting, and the page
+    // says which step it is waiting for when it takes long.
+    const within = (promise, ms) => Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(undefined), ms))]);
     try {
-      try { await window.LocalNative.ready(); } catch (e) { say(String(e.message || e), true); }
+      S.step = "a lista de arquivos";
+      void api("list_sources", {}, { silent: true }).then((list) => { if (alive(g)) { S.sources = list || []; window.ExtractionEasy?.refresh?.(); } }).catch(() => {});
+      S.step = "as definições do Caso";
+      // Until the Case's saved maps are known, nothing may be saved: a new map could replace one that exists.
+      S.defsReady = false;
+      let late = false;
+      // The first read can happen before the Case's area is ready; it is repeated once it is.
+      const defs = (async () => {
+        let ok = await loadDerivedFields().catch(() => false);
+        if (ok === false) { try { await window.LocalNative.ready(); } catch { /* the second read decides */ } ok = await loadDerivedFields().catch(() => false); }
+        return ok;
+      })().then((ok) => {
+        if (!alive(g)) return ok;
+        S.defsReady = ok !== false;
+        if (late && S.defsReady) {
+          const wanted = prefs().current && prefs().current !== "__novo__" ? prefs().current : null;
+          if (!dirty() && !S.installed) loadInstalled(wanted && installedMaps().some((d) => d.name === wanted) ? wanted : installedMaps()[0]?.name ?? null);
+          try { paintAll(); } catch (e) { console.error("extraction advanced view", e); }
+          window.ExtractionEasy?.reload?.();
+        }
+        return ok;
+      });
+      if ((await within(defs.then(() => true), 8000)) === undefined) late = true;
       if (!alive(g)) return;
-      try { S.sources = (await api("list_sources", {}, { silent: true })) || []; } catch { S.sources = []; }
-      if (!alive(g)) return;
-      await loadDerivedFields().catch(() => {});
-      if (!alive(g)) return;
+      S.step = "";
       if (switched || !S.def) {
         const wanted = prefs().current && prefs().current !== "__novo__" ? prefs().current : null;
         loadInstalled(wanted && installedMaps().some((d) => d.name === wanted) ? wanted : installedMaps()[0]?.name ?? null);

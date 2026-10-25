@@ -209,8 +209,9 @@ window.ExtractionEasy = (() => {
     if (!root) return;
     paintTop(); paintGroups(); paintSuggest(); paintLine(); paintTable(); paintCover();
     const err = q("#e-error");
-    err.hidden = !E.error;
-    err.textContent = E.error ? `Não foi possível ler amostras: ${E.error}` : "";
+    err.dataset.note = String(!E.error);
+    err.hidden = !E.error && !(E.loading && E.note);
+    err.textContent = E.error ? `Não foi possível ler amostras: ${E.error}` : E.loading && E.note ? E.note : "";
   }
   function paintTop() {
     const s = S();
@@ -552,6 +553,7 @@ window.ExtractionEasy = (() => {
   async function applyDialog() {
     const s = S(), d = q("#e-dlg");
     if (!s.valid) { say(s.error || "A definição tem problemas"); return; }
+    if (core.S.defsReady === false) { say("As definições do Caso ainda estão carregando"); return; }
     const easy = Object.keys(def().ui?.easy || {});
     if (!easy.length) { say("Ensine ao menos um tipo de linha"); return; }
     const prefix = s.name || "norm";
@@ -570,7 +572,7 @@ window.ExtractionEasy = (() => {
       if (d.returnValue !== "ok") return;
       const name = (d.querySelector("#e-prefix")?.value || "").trim() || "norm";
       core.S.name = name; core.paintHeader();
-      try { await core.save(); paint(); say("Aplicado ao Caso"); } catch (e) { say(String(e.message || e)); }
+      try { const saved = await core.save(); paint(); if (saved) say("Aplicado ao Caso"); else say(core.S.notice || "Não foi possível aplicar"); } catch (e) { say(String(e.message || e)); }
     };
     d.showModal();
   }
@@ -627,6 +629,14 @@ window.ExtractionEasy = (() => {
     shell();
     E.loading = true; paintGroups();
     const mine = gen;
+    // If opening takes long, the page says what it is waiting for instead of only showing the placeholder.
+    clearTimeout(timers.slow);
+    timers.slow = setTimeout(() => {
+      if (mine !== gen || !root || (!core.S.step && !E.loading)) return;
+      E.note = core.S.step ? `Aguardando ${core.S.step}…` : "Lendo as amostras…";
+      const box = q("#e-error");
+      if (box && !E.error) { box.hidden = false; box.dataset.note = "true"; box.textContent = E.note; }
+    }, 3500);
     Promise.resolve(core.S.ready).then(() => {
       if (mine !== gen || !root) return;
       if (core.S.fatal || !core.S.def) { fail(core.S.fatal || new Error("A definição não pôde ser aberta.")); return; }
@@ -645,7 +655,9 @@ window.ExtractionEasy = (() => {
     if (box) { box.hidden = false; box.textContent = `Não foi possível abrir: ${String(error?.message || error)}`; }
     if (q("#e-groups")) q("#e-groups").innerHTML = "";
   }
-  function refresh() { if (root) { paint(); void evaluate(); } }
+  /** The Case's definitions arrived late: read them again. */
+  function reload() { if (root && core.S.def && core.S.onChange) { paintTop(); void load(); } }
+  function refresh() { if (root && core.S.def && core.S.onChange) { paint(); void evaluate(); } }
   function unmount() { gen++; clearTimeout(toastTimer); Object.values(timers).forEach(clearTimeout); if (core) core.S.onChange = null; root = null; }
-  return { mount, unmount, refresh, state: E };
+  return { mount, unmount, refresh, reload, state: E };
 })();

@@ -193,13 +193,18 @@ try {
       if (width !== 390) await page.screenshot({ path: `output/playwright/extraction-easy-${theme}-${width}.png`, fullPage: true });
     }
   }
-  // 12a. Opening can be slow (the Case is busy): the frame and a placeholder appear at once.
-  await page.evaluate(() => { const original = window.api; window.__origApi = original; window.api = (cmd, ...rest) => cmd === "list_sources" ? new Promise((resolve) => setTimeout(() => resolve(original(cmd, ...rest)), 2500)) : original(cmd, ...rest); });
+  // 12a. A Case that never answers the preparatory calls cannot keep the page waiting: the frame shows
+  // at once, says what it waits for, and the page opens after a bounded time.
   await page.evaluate(() => Workspace.showPage("sources"));
+  await page.evaluate(() => { const original = window.api; window.__origApi = original; window.api = (cmd, ...rest) => ["list_sources", "list_derived_fields"].includes(cmd) ? new Promise(() => {}) : original(cmd, ...rest); });
   await page.evaluate(() => { Workspace.showPage("extraction"); });
   await page.waitForSelector("#e-apply", { timeout: 1000 });
   assert.ok(await page.locator("#e-groups .e-skel").count() > 0, "a placeholder shows while the page loads");
-  await page.waitForFunction(() => document.querySelectorAll("#e-groups .e-group").length > 0, null, { timeout: 15000 });
+  await page.waitForFunction(() => /Aguardando/.test(document.querySelector("#e-error")?.textContent || ""), null, { timeout: 8000 });
+  await page.waitForFunction(() => document.querySelectorAll("#e-groups .e-group").length > 0, null, { timeout: 20000 });
+  // Nothing may be saved before the Case's saved maps are known: it could replace one of them.
+  await page.click("#e-apply");
+  await page.waitForFunction(() => /ainda estão carregando/.test(document.querySelector("#e-toast")?.textContent || ""));
   await page.evaluate(() => { window.api = window.__origApi; });
   // 12b. A failure while opening is said on the page; the frame is never left empty.
   await page.setViewportSize({ width: 1440, height: 900 });

@@ -451,9 +451,11 @@ try {
   await page.screenshot({ path: resolve(output, "extraction.png"), fullPage: true });
   await page.locator("#e-apply").click();
   await page.waitForSelector("#e-dlg[open]");
+  page.on("dialog", (d) => { process.stderr.write(`dialog: ${d.message()}
+`); void d.accept(); });
   await page.locator("#e-prefix").fill("easyreal");
   await page.locator("#e-dlg button[value=ok]").click();
-  await page.waitForFunction(() => Extraction.state.installed === "easyreal");
+  await page.waitForFunction(() => Extraction.state.installed === "easyreal", null, { timeout: 30000 }).catch(async (e) => { throw new Error(`${e.message} :: ${JSON.stringify(await page.evaluate(() => ({ defsReady: Extraction.state.defsReady, valid: Extraction.state.valid, error: Extraction.state.error, notice: Extraction.state.notice, installed: Extraction.state.installed, diag: Extraction.state.diagnostics, toast: document.querySelector("#e-toast")?.textContent, dlgOpen: document.querySelector("#e-dlg")?.open, dlgValue: document.querySelector("#e-dlg")?.returnValue, prefix: document.querySelector("#e-prefix")?.value, name: Extraction.state.name })))}`); });
   const easy = await page.evaluate(() => localNative({ action: "query", sql: 'SELECT "easyreal.user" AS u, try_cast("easyreal.sequence" AS BIGINT) AS s FROM events WHERE id=5' }));
   assert.deepEqual(easy.rows, [["ana", "5"]]);
   const wide = await page.evaluate(async () => (await localNative({ action: "map_scan", map_json: JSON.stringify(Extraction.state.def) })).rules.find((r) => r.rule === ExtractionEasy.state.gid));
