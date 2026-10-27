@@ -99,6 +99,17 @@ pub(crate) enum Request {
     MapSuggest {
         texts: Vec<String>,
     },
+    /// First records of a file as framed by the reader, or by a user-defined record start.
+    MapFrame {
+        path: String,
+        pattern: Option<String>,
+        count: Option<usize>,
+    },
+    /// Candidate patterns checked by the same PCRE2 engine that extracts the columns.
+    MapVerify {
+        texts: Vec<String>,
+        patterns: Vec<String>,
+    },
     /// The draft applied to sample records, with ranges and per-output states.
     MapEvaluate {
         map_json: String,
@@ -569,6 +580,24 @@ fn execute(state: &AppState, request: Request, filters: &[Filter]) -> Result<Val
             },
         ),
         Request::MapSuggest { texts } => crate::map_lab::suggest(&texts),
+        Request::MapFrame { path, pattern, count } => {
+            // Only files of the active source are read, and from the copy the reader actually opened.
+            let requested = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+            let physical = {
+                let source = analysis_runtime::source(state);
+                match &*source {
+                    SourceData::Indexed(index) => index
+                        .parts
+                        .iter()
+                        .find(|p| std::fs::canonicalize(&p.path).ok().as_ref() == Some(&requested))
+                        .map(|p| p.physical_path.clone()),
+                    _ => None,
+                }
+            };
+            let physical = physical.ok_or("O arquivo não pertence à fonte ativa.")?;
+            crate::map_columns::frame(&physical, pattern.as_deref(), count.unwrap_or(60))
+        }
+        Request::MapVerify { texts, patterns } => crate::map_columns::verify(&texts, &patterns),
         Request::MapEvaluate { map_json, samples } => {
             crate::map_lab::evaluate_samples(state, &map_json, samples)
         }
@@ -677,6 +706,8 @@ pub(crate) async fn local_analysis(
             | Request::MapCatalog
             | Request::MapCheck { .. }
             | Request::MapSuggest { .. }
+            | Request::MapFrame { .. }
+            | Request::MapVerify { .. }
             | Request::MapTry { .. }
             | Request::MapDiff { .. }
             | Request::SaveField { .. }

@@ -729,7 +729,7 @@ window.Extraction = (() => {
     const switched = !S.def || (ownerKey && ownerKey !== current);
     if (switched) { S.samples = null; S.quick = null; S.scan = null; S.diff = null; S.texts = []; S.segs = {}; S.pickedSources = null; S.index = null; S.suggest = null; }
     ownerKey = current;
-    root.innerHTML = `<div id="ex-easy" class="exe" ${S.view === "adv" ? "hidden" : ""}></div><section class="ex" id="ex-adv" ${S.view === "adv" ? "" : "hidden"} aria-label="Extração e normalização — avançado"><div id="ex-head" class="ex-head"></div><div class="ex-grid"><section id="ex-left" class="lx-pane ex-pane" aria-label="Amostras"></section><section id="ex-center" class="lx-pane ex-pane" aria-label="Regras e saídas"></section><section class="lx-pane ex-pane" aria-label="Resultado e verificação"><header><h2>3 · Resultado e verificação</h2></header><div id="ex-tabs" class="ex-tabs" role="tablist"></div><div id="ex-right-body" class="ex-right"></div></section></div></section>`;
+    root.innerHTML = `<div id="ex-easy" ${S.view === "adv" ? "hidden" : ""}></div><section class="ex" id="ex-adv" ${S.view === "adv" ? "" : "hidden"} aria-label="Extração e normalização — avançado"><div id="ex-head" class="ex-head"></div><div class="ex-grid"><section id="ex-left" class="lx-pane ex-pane" aria-label="Amostras"></section><section id="ex-center" class="lx-pane ex-pane" aria-label="Regras e saídas"></section><section class="lx-pane ex-pane" aria-label="Resultado e verificação"><header><h2>3 · Resultado e verificação</h2></header><div id="ex-tabs" class="ex-tabs" role="tablist"></div><div id="ex-right-body" class="ex-right"></div></section></div></section>`;
     const g = generation;
     root.onclick = onClick; root.onchange = onChange; root.oninput = onInput; root.onsubmit = onSubmit; root.oncontextmenu = onContext; root.onkeydown = onKey;
     document.removeEventListener("selectionchange", onSelect);
@@ -739,13 +739,13 @@ window.Extraction = (() => {
     let ready;
     S.ready = new Promise((resolve) => { ready = resolve; });
     S.fatal = null;
-    window.ExtractionEasy?.mount($("#ex-easy"), core);
+    window.ExtractionColumns?.mount($("#ex-easy"), core);
     // Each step is bounded: a Case that is busy elsewhere must not keep this page waiting, and the page
     // says which step it is waiting for when it takes long.
     const within = (promise, ms) => Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(undefined), ms))]);
     try {
       S.step = "a lista de arquivos";
-      void api("list_sources", {}, { silent: true }).then((list) => { if (alive(g)) { S.sources = list || []; window.ExtractionEasy?.refresh?.(); } }).catch(() => {});
+      void api("list_sources", {}, { silent: true }).then((list) => { if (alive(g)) { S.sources = list || []; window.ExtractionColumns?.refresh?.(); } }).catch(() => {});
       S.step = "as definições do Caso";
       // Until the Case's saved maps are known, nothing may be saved: a new map could replace one that exists.
       S.defsReady = false;
@@ -762,7 +762,7 @@ window.Extraction = (() => {
           const wanted = prefs().current && prefs().current !== "__novo__" ? prefs().current : null;
           if (!dirty() && !S.installed) loadInstalled(wanted && installedMaps().some((d) => d.name === wanted) ? wanted : installedMaps()[0]?.name ?? null);
           try { paintAll(); } catch (e) { console.error("extraction advanced view", e); }
-          window.ExtractionEasy?.reload?.();
+          window.ExtractionColumns?.reload?.();
         }
         return ok;
       });
@@ -788,7 +788,7 @@ window.Extraction = (() => {
     document.removeEventListener("selectionchange", onSelect);
     window.LocalNative.cancel("map-sample"); window.LocalNative.cancel("map-quick");
     Object.values(timers).forEach(clearTimeout); timers = {};
-    window.ExtractionEasy?.unmount?.();
+    window.ExtractionColumns?.unmount?.();
     root = null; generation++;
   }
   function setView(view) {
@@ -796,9 +796,9 @@ window.Extraction = (() => {
     const easy = q("#ex-easy"), adv = q("#ex-adv");
     if (!easy || !adv) return;
     easy.hidden = view !== "easy"; adv.hidden = view !== "adv";
-    if (view === "adv") { paintAll(); void check(); } else window.ExtractionEasy?.refresh?.();
+    if (view === "adv") { paintAll(); void check(); } else window.ExtractionColumns?.refresh?.();
   }
-  const core = { S, M, call, alive: () => alive(generation), text, commit, save, check, scan, computeDiff, installedMaps, say, paintHeader, setView, refreshIndexes, saveDraft, loadInstalled, get generation() { return generation; }, get root() { return root; } };
+  const core = { S, M, travel, call, alive: () => alive(generation), text, commit, save, check, scan, computeDiff, installedMaps, say, paintHeader, setView, refreshIndexes, saveDraft, loadInstalled, get generation() { return generation; }, get root() { return root; } };
   document.addEventListener("analysis-context-change", () => { if (root && ownerKey && ownerKey !== window.LocalNative.stamp()) void mount(root); });
   return { mount, unmount, state: S, _model: M, core };
 })();

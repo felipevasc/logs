@@ -80,6 +80,7 @@ mod grok;
 mod map_values;
 mod map_extract;
 mod enrichment_maps;
+mod map_columns;
 mod map_lab;
 mod map_templates;
 mod advanced_fields;

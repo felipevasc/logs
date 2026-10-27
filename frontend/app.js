@@ -3256,6 +3256,8 @@ function buildTsConfig() {
     rules: collectTsRules(),
     format: tsFormatValue(),
     complement: $("#ts-complement").value.trim() || null,
+    // O início de registro é ajustado na página de extração; salvar a data/hora não o apaga.
+    ...(state.tsRecordStart ? { record_start: state.tsRecordStart } : {}),
   };
 }
 
@@ -3281,6 +3283,7 @@ function replaceTsEditorConfig(cfg) {
   $("#ts-zone").value = cfg?.timezone_offset_minutes == null ? "" : String(cfg.timezone_offset_minutes);
   $("#ts-clock").value = String((cfg?.clock_adjustment_ms || 0) / 1000);
   state.tsSources = [...(cfg?.sources || [])];
+  state.tsRecordStart = cfg?.record_start || null;
   $("#ts-regex").value = "";
   $("#ts-template").value = "";
   $("#ts-assembled").textContent = "";

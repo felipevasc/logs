@@ -35,33 +35,55 @@ são emitidos como texto para não perder dígitos. Datas exigem formato e fuso 
 Alterar título, notas, cores ou preferências de índice **não** invalida caches nem
 índices; alterar qualquer coisa que muda um valor, sim (assinatura semântica).
 
-## Modo simples (padrão)
+## Colunas (modo simples, padrão)
 
-A página abre no **modo simples**, pensado para ensinar pelo exemplo, com quase nenhum texto: as
-explicações ficam atrás de um ícone ⓘ que abre um modal.
+A página abre numa **tela só**, com quase nenhum texto: as explicações ficam atrás de um ícone ⓘ
+que abre um modal. Há uma aba por arquivo da fonte (a amostra e o início de registro valem por
+arquivo; as colunas valem para a definição inteira).
 
-- **Tipos de linha** (à esquerda): o motor sorteia amostras de todas as fontes e as agrupa pela
-  aparência. Cada tipo mostra um anel com a cobertura e, quando se encaixa num formato pronto (acesso
-  HTTP, chave=valor, JSON, CSV…), oferece “Usar este formato”. Botão direito no tipo: renomear ou
-  recomeçar.
-- **Linha de exemplo**: os pedaços que o motor reconheceu (IP, datas, valores de `chave=valor`, com a
-  unidade e as aspas de fora) aparecem sublinhados. Um clique vira coluna; outro clique ignora.
-  Qualquer trecho selecionado abre, com o botão direito, um menu curto: coluna, o que vem depois/antes,
-  entre marcadores, ignorar, texto fixo, permitir variação, opcional, separar por delimitador.
-  Reconhecidos entre colunas (um IP no meio da linha) viram padrões e não o texto daquela linha.
-- **Tabela ao vivo**: calculada pelo motor nativo sobre as amostras. Cabeçalho: renomear, tipo (data
-  pede formato e fuso), normalizações (minúsculas, sem espaços, só o nome do arquivo, hex→decimal),
-  valores frequentes, criar índice, duplicar, remover. Célula: copiar, ver na linha e, quando a
-  conversão falha, o motivo e o conserto (“trocar vírgula por ponto”).
-- **Cobertura e sobras**: estimativa sobre as amostras do tipo (a contagem completa está em
-  “Conferir no conjunto”, no diálogo de aplicar). O selo vermelho lista as linhas que sobraram; cada
-  uma pode ser ensinada como um tipo próprio.
-- **Aplicar**: resume os campos, deixa conferir no conjunto e salva no Caso. Desfazer/refazer e os
-  rascunhos são os mesmos do modo avançado.
+1. **Amostra**: registros reais, sorteados de forma repetível, lidos como o texto original do
+   registro (`raw`, inclusive as várias linhas). Em cinza, sublinhado, o que o aplicativo **já
+   reconheceu ao indexar** (os campos do formato: timestamp, nível, chaves de JSON…); em cores, as
+   colunas que você criou; tracejado, a coluna em criação. Pedaços reconhecíveis (IP, data,
+   duração, exceção…) aparecem sublinhados: um clique cria uma coluna a partir deles.
+2. **Criar coluna**: selecione qualquer trecho e clique na dica **Criar coluna** que aparece sobre
+   ele (ou use o botão direito). Só então as sugestões são calculadas.
+   O motor (`columns-engine.js`) combina *o que o valor é* (um dos ~45 tipos do catálogo —
+   ECS/Grok/Splunk CIM —, texto entre delimitadores, valor de uma `chave=valor`, palavras, formato
+   do texto, blocos de várias linhas…) com *onde ele está* (começo/fim da linha ou do registro, N-ésima
+   linha, N-ésima ocorrência, depois/antes de um texto ou de um símbolo, entre delimitadores…).
+   **Toda sugestão é conferida**: tem de devolver exatamente o trecho escolhido, na posição
+   escolhida (a 3ª ocorrência, na 2ª linha…). A conferência final é do motor nativo (`map_verify`,
+   PCRE2 com prazo), e só ficam as que ele confirma. Sempre há alguma sugestão: na falta de
+   padrão inteligente, aparecem alternativas marcadas “Alternativa:” (o texto exato, o texto que
+   vem antes/depois, a posição no registro). Cada sugestão mostra em quantas amostras encaixa, se
+   é estável e o que extrai.
+3. **Expressão**: a sugestão escolhida vira expressão **Grok** (com padrões próprios `NOME_XXXX`
+   gravados em `grokPatterns`) ou **Regex** (PCRE2, grupo nomeado), editável com retorno ao vivo do
+   motor nativo. Se a forma Grok não devolve o mesmo trecho que a verificação confirmou, a coluna é
+   gravada em Regex e a tela avisa.
+4. **Nome e tipo**: o nome tem sugestões de um clique (palavra anterior, tipo, nomes ECS) e se renomeia
+   com duplo clique na tabela; o tipo vem de um seletor com busca (texto, inteiro, decimal, data/hora,
+   IP, porta, hash, caminho…). Tipos que o motor sabe converter viram conversão (`integer`,
+   `decimal`, `boolean`, `ip`, `datetime` com o formato deduzido do valor); os demais ficam como
+   texto marcado com o tipo. Valores que não cabem no tipo são sinalizados na tabela.
+5. **Registro de várias linhas**: abaixo da amostra, “Registro começa com” mostra o que o leitor
+   detectou (ou o que você definiu). Editar abre uma prévia do enquadramento (`map_frame`) e, ao
+   salvar, grava `record_start` na configuração do arquivo (a mesma de data/hora, `TsConfig`) e
+   **reabre a fonte**: o enquadramento é do índice, então ele é refeito. A expressão é de uma linha
+   física, na sintaxe Rust regex; linhas que não a casam continuam o registro anterior. As colunas
+   leem o registro inteiro.
+6. **Tabela de colunas** (sempre embaixo): Coluna, Tipo, Exemplos. A coluna em criação é a primeira
+   linha, em destaque; depois as suas colunas e as que já existiam. Botão direito: renomear, tipo,
+   editar o padrão, copiar a expressão, remover.
+7. **Aplicar**: resume os campos, deixa conferir no conjunto e salva no Caso pelo mesmo caminho do
+   modo avançado. Desfazer/refazer e os rascunhos também são os mesmos.
 
-O modo simples escreve na mesma definição: a linha de exemplo e as marcações ficam em
-`ui.easy` da definição, para reabrir e continuar editando. Regras criadas no modo avançado aparecem
-como “+N” e só se editam lá. O botão `</>` abre o **modo avançado**, com tudo que existia antes.
+Cada coluna é **uma regra** da definição (`col-<nome>`, extração `grok` ou `regex` sobre `raw`, uma saída
+com `from` = nome do grupo); `ui.columns` guarda as formas Grok/Regex e o tipo escolhido para reabrir a
+edição. O botão `</>` abre o **modo avançado**, com tudo que existia antes. Limites conhecidos: datas sem
+fuso são lidas como UTC; só as formas ISO, log HTTP e epoch viram conversão de data (os demais formatos de
+data ficam como texto).
 
 ## Modo avançado: fluxo com amostras reais
 
@@ -141,9 +163,10 @@ registro aceita até 128 saídas e 512 KiB.
 ## Testes e como subir
 
 - Rust: `cargo test --lib -- --test-threads=1 grok:: map_values:: map_extract::
-  enrichment_maps:: map_lab:: map_templates:: field_indexes::` e `cargo test --test
+  enrichment_maps:: map_lab:: map_columns:: map_templates:: field_indexes::` e `cargo test --test
   engine_parity`.
-- JavaScript: `npm test` (inclui `extraction-model.test.mjs`).
+- JavaScript: `npm test` (inclui `extraction-model.test.mjs` e `columns-engine.test.mjs`, que confere
+  que toda seleção tem sugestão e que cada sugestão reproduz o trecho).
 - Prévia: `node scripts/preview/serve.mjs` e `node scripts/preview/test-extraction.mjs`
   (motor simulado; a semântica nativa é coberta pelos testes Rust e
   `test-local-native.mjs`).

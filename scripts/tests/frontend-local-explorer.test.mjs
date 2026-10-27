@@ -109,9 +109,9 @@ test("expression drafts are bounded and only accept known engines", () => {
 test("every new script is bundled and loaded by the page", () => {
   const html = readFileSync(new URL("../../frontend/index.html", import.meta.url), "utf8");
   const prepare = readFileSync(new URL("../prepare-frontend.mjs", import.meta.url), "utf8");
-  for (const file of ["local-native.js", "local-explorer.js", "file-viewer.js", "regex-syntax.js", "regex-editor.js", "regex-assist.js", "regex-workbench.js", "event-context.js", "event-pattern-search.js", "field-extraction.js", "extraction-model.js", "extraction-easy.js", "extraction.js"]) {
+  for (const file of ["local-native.js", "local-explorer.js", "file-viewer.js", "regex-syntax.js", "regex-editor.js", "regex-assist.js", "regex-workbench.js", "event-context.js", "event-pattern-search.js", "field-extraction.js", "extraction-model.js", "columns-engine.js", "columns.js", "extraction.js"]) {
     assert.ok(html.includes(`src="${file}"`), file);
     assert.ok(prepare.includes(`"${file}"`), file);
   }
-  for (const file of ["regex-editor.css", "local-explorer.css"]) assert.ok(html.includes(`href="${file}"`) && prepare.includes(`"${file}"`), file);
+  for (const file of ["regex-editor.css", "local-explorer.css", "columns.css"]) assert.ok(html.includes(`href="${file}"`) && prepare.includes(`"${file}"`), file);
 });

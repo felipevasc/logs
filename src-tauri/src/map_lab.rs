@@ -82,6 +82,32 @@ struct Candidate {
     text: String,
     shape: String,
     offset: u64,
+    detected: Value,
+}
+/// The columns the reader found in a record when it was indexed: the standard ones that carry
+/// something, then every field of the format. Only short scalar values, the way a table shows them.
+fn detected_of(event: &crate::model::Event) -> Value {
+    let mut standard = Map::new();
+    if let Some(ts) = event.timestamp {
+        standard.insert("timestamp".into(), json!(crate::model::ts_to_iso(ts)));
+    }
+    for (name, value) in [("level", &event.level), ("source", &event.source), ("code", &event.code), ("name", &event.name), ("description", &event.description)] {
+        if !value.is_empty() {
+            standard.insert(name.into(), json!(cut(value, 200).0));
+        }
+    }
+    let mut fields = Map::new();
+    for (name, value) in event.fields.iter().take(80) {
+        let text = match value {
+            Value::String(s) => s.clone(),
+            Value::Number(_) | Value::Bool(_) => value.to_string(),
+            _ => continue,
+        };
+        if !text.is_empty() {
+            fields.insert(name.clone(), json!(cut(&text, 200).0));
+        }
+    }
+    json!({"standard": standard, "fields": fields})
 }
 pub(crate) fn sample(state: &AppState, request: SampleRequest) -> Result<Value, String> {
     let count = request.count.unwrap_or(40).clamp(1, MAX_SAMPLES);
@@ -143,7 +169,7 @@ pub(crate) fn sample(state: &AppState, request: SampleRequest) -> Result<Value, 
                     SourceData::Indexed(idx) => idx.lines.at(id).offset - idx.part_at(id).base,
                     _ => 0,
                 };
-                pool.push(Candidate { id, part, event_ref: event.event_ref.clone(), shape: shape(&text), text, offset });
+                pool.push(Candidate { id, part, event_ref: event.event_ref.clone(), shape: shape(&text), detected: detected_of(&event), text, offset });
             }
         }
         Ok::<_, String>(())
@@ -205,7 +231,7 @@ pub(crate) fn sample(state: &AppState, request: SampleRequest) -> Result<Value, 
             *selected_by_part.entry(c.part).or_default() += 1;
             let (text, truncated) = cut(&c.text, SAMPLE_TEXT_LIMIT);
             let rank = shapes.iter().position(|(k, _)| *k == c.shape).unwrap_or(0);
-            json!({"id":c.id,"eventRef":c.event_ref,"file":names[c.part].0,"fileName":names[c.part].1,"offset":c.offset.to_string(),"text":text,"truncated":truncated,"bytes":c.text.len(),"shape":c.shape,"shapeRank":rank,"shapeCount":shapes[rank].1.len()})
+            json!({"id":c.id,"eventRef":c.event_ref,"file":names[c.part].0,"fileName":names[c.part].1,"offset":c.offset.to_string(),"text":text,"truncated":truncated,"bytes":c.text.len(),"shape":c.shape,"shapeRank":rank,"shapeCount":shapes[rank].1.len(),"detected":c.detected})
         })
         .collect();
     let distribution: Vec<Value> = chosen

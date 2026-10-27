@@ -433,34 +433,54 @@ try {
   assert.equal(indexes.left, 1);
   record("range-and-terms-indexes-built-removed-and-equivalent-on-the-real-engine");
   await page.evaluate(() => Workspace.showPage("extraction"));
-  await page.waitForSelector("#e-groups .e-group");
-  await page.waitForFunction(() => document.querySelectorAll("#e-line .e-chip").length >= 2);
-  const groups = await page.evaluate(() => Extraction.core && ExtractionEasy.state.groups.map((g) => ({ id: g.id, name: g.name, lines: g.lines.length, population: g.population })));
-  assert.ok(groups.length >= 1 && groups[0].lines > 5, JSON.stringify(groups));
-  assert.ok(groups.reduce((n, g) => n + (g.population || 0), 0) > 300, "the types stand for the records of the source");
-  // Teach the type by clicking the recognized pieces of the example line; the table comes from the real engine.
-  await page.locator("#e-line .e-chip", { hasText: "ana" }).first().click();
-  await page.locator("#e-line .e-chip").filter({ hasText: /^\d+$/ }).first().click();
-  await page.waitForFunction(() => document.querySelectorAll("#e-table th").length === 2);
-  const names = await page.locator("#e-table th").evaluateAll((els) => els.map((e) => e.dataset.eCol));
-  assert.deepEqual(names, ["user", "sequence"]);
-  await page.waitForFunction(() => /^ana$/.test(document.querySelector("#e-table tbody tr td")?.textContent || ""));
-  await page.waitForFunction(() => document.querySelector("#e-cov")?.textContent === "100%");
-  const seqType = await page.evaluate(() => Extraction.state.def.rules.find((r) => r.id === ExtractionEasy.state.gid).fields.sequence.type);
+  await page.waitForSelector("#cx-record .cx-m", { timeout: 30000 });
+  const open = await page.evaluate(() => ({ records: ExtractionColumns.state.recs.length, population: ExtractionColumns.state.population, detected: document.querySelectorAll("#cx-rows tr[data-ex]").length }));
+  assert.ok(open.records > 5 && open.population >= 400, JSON.stringify(open));
+  assert.ok(open.detected >= 1, "the fields found while indexing are listed as already existing columns");
+  // The records are framed by the real reader and the user's record start is previewed by the same engine.
+  const framed = await page.evaluate(() => localNative({ action: "map_frame", path: ExtractionColumns.state.recs[0].path, pattern: null, count: 5 }));
+  assert.ok(framed.records.length >= 1 && typeof framed.format === "string", JSON.stringify(framed));
+  const selectRegex = (re) => page.evaluate((source) => {
+    const el = document.querySelector("#cx-record"), all = el.textContent, m = new RegExp(source).exec(all);
+    if (!m) throw new Error("trecho não encontrado: " + source);
+    const start = m.index + m[0].length - m[1].length, end = start + m[1].length;
+    const at = (pos) => { const wk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT); let node, acc = 0; while ((node = wk.nextNode())) { if (pos <= acc + node.textContent.length) return [node, pos - acc]; acc += node.textContent.length; } return [node, node.textContent.length]; };
+    const [sn, so] = at(start), [en, eo] = at(end);
+    getSelection().setBaseAndExtent(sn, so, en, eo);
+  }, re.source);
+  const makeColumn = async (re, name, type) => {
+    await selectRegex(re);
+    await page.locator("#cx-record").dispatchEvent("mouseup");
+    await page.waitForSelector("#cx-seltip:not([hidden])");
+    await page.click("#cx-seltip");
+    await page.waitForSelector("#cx-new.draft .cx-opt");
+    // The real PCRE2 engine confirms every suggestion before it is offered as a choice.
+    await page.waitForFunction(() => !/confirmando/.test(document.querySelector("#cx-new").textContent), null, { timeout: 30000 });
+    assert.ok(await page.evaluate(() => ExtractionColumns.state.draft.native === "ok" && ExtractionColumns.state.draft.cands.every((c) => c.confirmed)), "native confirmation");
+    await page.fill("#cx-nameinput", name);
+    if (type) { await page.click("#cx-typebtn"); await page.fill("#cx-tq", type); await page.locator("#cx-tp button", { hasText: type }).first().click(); }
+    await page.click("#cx-d-ok");
+    await page.waitForFunction((n) => document.querySelector('#cx-rows tr[data-c="' + n + '"]') !== null, name);
+  };
+  await makeColumn(/user=(ana)/, "quem", null);
+  await makeColumn(/sequence=(\d+)/, "seq", "Inteiro");
+  await page.waitForFunction(() => /^ana\b/.test(document.querySelector('#cx-rows tr[data-c="quem"] td.cx-ex')?.textContent || ""));
+  const names = await page.locator("#cx-rows tr[data-c] td.nm").allTextContents();
+  assert.deepEqual(names.map((n) => n.trim()), ["quem", "seq"]);
+  const seqType = await page.evaluate(() => Extraction.state.def.rules.find((r) => r.id === "col-seq").fields.seq.type);
   assert.equal(seqType, "integer");
   await page.screenshot({ path: resolve(output, "extraction.png"), fullPage: true });
-  await page.locator("#e-apply").click();
-  await page.waitForSelector("#e-dlg[open]");
-  page.on("dialog", (d) => { process.stderr.write(`dialog: ${d.message()}
-`); void d.accept(); });
-  await page.locator("#e-prefix").fill("easyreal");
-  await page.locator("#e-dlg button[value=ok]").click();
-  await page.waitForFunction(() => Extraction.state.installed === "easyreal", null, { timeout: 30000 }).catch(async (e) => { throw new Error(`${e.message} :: ${JSON.stringify(await page.evaluate(() => ({ defsReady: Extraction.state.defsReady, valid: Extraction.state.valid, error: Extraction.state.error, notice: Extraction.state.notice, installed: Extraction.state.installed, diag: Extraction.state.diagnostics, toast: document.querySelector("#e-toast")?.textContent, dlgOpen: document.querySelector("#e-dlg")?.open, dlgValue: document.querySelector("#e-dlg")?.returnValue, prefix: document.querySelector("#e-prefix")?.value, name: Extraction.state.name })))}`); });
-  const easy = await page.evaluate(() => localNative({ action: "query", sql: 'SELECT "easyreal.user" AS u, try_cast("easyreal.sequence" AS BIGINT) AS s FROM events WHERE id=5' }));
+  await page.locator("#cx-apply").click();
+  await page.waitForSelector("#cx-dlg[open]");
+  page.on("dialog", (d) => { process.stderr.write("dialog: " + d.message() + "\n"); void d.accept(); });
+  await page.locator("#cx-prefix").fill("easyreal");
+  await page.locator("#cx-dlg button[value=ok]").click();
+  await page.waitForFunction(() => Extraction.state.installed === "easyreal", null, { timeout: 30000 }).catch(async (e) => { throw new Error(e.message + " :: " + JSON.stringify(await page.evaluate(() => ({ defsReady: Extraction.state.defsReady, valid: Extraction.state.valid, error: Extraction.state.error, notice: Extraction.state.notice, toast: document.querySelector("#cx-toast")?.textContent })))); });
+  const easy = await page.evaluate(() => localNative({ action: "query", sql: 'SELECT "easyreal.quem" AS u, try_cast("easyreal.seq" AS BIGINT) AS s FROM events WHERE id=5' }));
   assert.deepEqual(easy.rows, [["ana", "5"]]);
-  const wide = await page.evaluate(async () => (await localNative({ action: "map_scan", map_json: JSON.stringify(Extraction.state.def) })).rules.find((r) => r.rule === ExtractionEasy.state.gid));
-  assert.equal(wide.recognized, 401);
-  record("extraction-simple-mode-teaches-by-click-saves-and-feeds-sql-on-the-real-engine");
+  const wide = await page.evaluate(async () => (await localNative({ action: "map_scan", map_json: JSON.stringify(Extraction.state.def) })).rules.find((r) => r.rule === "col-seq"));
+  assert.ok(wide.recognized >= 400, JSON.stringify(wide));
+  record("extraction-columns-select-confirm-save-and-feed-sql-on-the-real-engine");
   const tree = await page.evaluate(() => localNative({ action: "processes" }));
   const root = tree.nodes.find((n) => n.pid === "100");
   assert.ok(root);

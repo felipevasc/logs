@@ -2096,6 +2096,11 @@ pub struct TsConfig {
     /// Vazio = usa `regex`/`template` da raiz (formato legado).
     #[serde(default)]
     pub rules: Vec<TsRule>,
+    /// Início de registro definido pelo usuário (regex do crate `regex`, aplicada a uma linha física).
+    /// Vale no lugar do início detectado: linhas que não o casam continuam o registro anterior.
+    /// Muda o enquadramento, então a fonte precisa ser reaberta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_start: Option<String>,
 }
 
 /// Uma alternativa de extração de data/hora (regex + montagem opcional).
@@ -2119,6 +2124,7 @@ pub struct CompiledTsConfig {
     pub complement: Option<String>,
     /// (regex compilada, template) por regra, na ordem do OU
     pub rules: Vec<(Option<regex::Regex>, Option<String>)>,
+    pub record_start: Option<String>,
 }
 
 impl CompiledTsConfig {
@@ -2138,6 +2144,7 @@ impl CompiledTsConfig {
         let mut signature = format!("{:?}|{}|{:?}|{:?}|{}|{:?}", self.sources, self.format,
             self.complement, self.timezone_offset_minutes, self.clock_adjustment_ms, rules);
         if fallback_date { signature.push_str(&format!("|reference-date:{}", self.reference_date)); }
+        if let Some(start) = &self.record_start { signature.push_str(&format!("|record-start:{start}")); }
         signature
     }
 }
@@ -2168,7 +2175,16 @@ impl TsConfig {
                 .map_err(|e| format!("Regex da config de data inválida: {e}"))?;
             rules.push((re, r.template));
         }
+        let record_start = match self.record_start.as_deref().map(|s| s.trim_matches(['\r', '\n'])) {
+            None | Some("") => None,
+            Some(pattern) => {
+                if pattern.len() > 2048 { return Err("O início de registro excede 2 KiB.".into()); }
+                regex::RegexBuilder::new(pattern).size_limit(8 << 20).build().map_err(|e| format!("Início de registro inválido: {e}"))?;
+                Some(pattern.to_owned())
+            }
+        };
         Ok(CompiledTsConfig {
+            record_start,
             reference_date: chrono::Utc::now().date_naive(),
             timezone_offset_minutes: self.timezone_offset_minutes,
             clock_adjustment_ms: self.clock_adjustment_ms,
@@ -3830,11 +3846,13 @@ pub(crate) fn prepare_index_from(path: &str, origin: Option<(&str, &str)>, forma
         let sample: Vec<std::borrow::Cow<'_, str>> = mmap.split(|&b| b == b'\n').take(2_000).map(decode_text).collect();
         calendar.day_first = stamp::learn_day_first(sample.iter().map(|line| line.as_ref()));
     }
-    let start_pattern = match fmt.as_str() {
+    // The user's record start replaces the detected one for any format read line by line.
+    let user_start = saved_ts.as_ref().and_then(|ts| ts.record_start.clone()).filter(|_| !matches!(fmt.as_str(), "jsonl" | "xml" | "snapshot"));
+    let start_pattern = user_start.or_else(|| match fmt.as_str() {
         "log4j" | "wildfly" => detect_entry_start(&mmap).map(|re| re.as_str().to_string()),
         "mixed" => detect_record_start(&mmap, &calendar.context()),
         _ => None,
-    };
+    });
     let content_start = if mmap.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
     let first_byte = (content_start..mmap.len()).find(|&i| !mmap[i].is_ascii_whitespace());
     let array = first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'[').map(|start| (start, false))
@@ -3859,6 +3877,21 @@ pub(crate) fn prepare_index_from(path: &str, origin: Option<(&str, &str)>, forma
     };
     prepared.validate()?;
     Ok(prepared)
+}
+
+/// What the reader would detect for a file's first bytes: its format and the record start (a
+/// regex over one physical line) when the records span several lines. Same rules as indexing.
+pub(crate) fn detected_framing(bytes: &[u8]) -> Result<(String, Option<String>), String> {
+    let fmt = match detect_format(bytes) { "text" => "mixed", detected => detected }.to_string();
+    let mut calendar = ParserCalendar::current()?;
+    let sample: Vec<std::borrow::Cow<'_, str>> = bytes.split(|&b| b == b'\n').take(2_000).map(decode_text).collect();
+    calendar.day_first = stamp::learn_day_first(sample.iter().map(|line| line.as_ref()));
+    let start = match fmt.as_str() {
+        "log4j" | "wildfly" => detect_entry_start(bytes).map(|re| re.as_str().to_string()),
+        "mixed" => detect_record_start(bytes, &calendar.context()),
+        _ => None,
+    };
+    Ok((fmt, start))
 }
 
 pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metadata_checkpoint::Resume, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {

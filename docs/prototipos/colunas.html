@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Colunas — protótipo</title>
+<style>
+:root { --bg:#f4f5f7; --panel:#fff; --ink:#1c2230; --muted:#8a93a6; --line:#e6e9ef; --soft:#f0f2f6; --accent:#e07a1f; --accent-soft:#fdf0e3; --ok:#2b9a57; --warn:#c98a1b; --bad:#d23f3f; --mono:ui-monospace,"Cascadia Code",Consolas,monospace; --shadow:0 10px 30px rgba(20,28,45,.16); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#12151c; --panel:#1a1f29; --ink:#e8ebf2; --muted:#7f8aa0; --line:#2a3140; --soft:#232a37; --accent:#f29a4b; --accent-soft:#35261a; --ok:#54c27e; --warn:#e3b25a; --bad:#ff8585; --shadow:0 10px 30px rgba(0,0,0,.5); } }
+:root[data-theme="dark"] { --bg:#12151c; --panel:#1a1f29; --ink:#e8ebf2; --muted:#7f8aa0; --line:#2a3140; --soft:#232a37; --accent:#f29a4b; --accent-soft:#35261a; --ok:#54c27e; --warn:#e3b25a; --bad:#ff8585; --shadow:0 10px 30px rgba(0,0,0,.5); }
+* { box-sizing:border-box; } [hidden] { display:none !important; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.4 system-ui,"Segoe UI",sans-serif; padding-bottom:260px; }
+button { font:inherit; color:inherit; cursor:pointer; }
+svg { width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; flex:none; }
+.ib { display:inline-grid; place-items:center; width:30px; height:30px; border:0; border-radius:8px; background:none; color:var(--muted); }
+.ib:hover:not(:disabled) { background:var(--soft); color:var(--ink); } .ib:disabled { opacity:.35; cursor:default; }
+.i { display:inline-grid; place-items:center; width:18px; height:18px; border:0; background:none; color:var(--muted); border-radius:50%; padding:0; opacity:.7; vertical-align:middle; }
+.i:hover { opacity:1; color:var(--accent); } .i svg { width:14px; height:14px; }
+.btn { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); background:var(--panel); border-radius:9px; padding:6px 12px; }
+.btn:hover { border-color:var(--accent); } .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; } .btn.small { padding:3px 10px; font-size:13px; }
+.top { display:flex; align-items:center; gap:6px; padding:10px 18px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+.top h1 { font-size:15px; margin:0 10px 0 0; } .grow { flex:1; }
+.tabs { display:flex; gap:4px; flex-wrap:wrap; }
+.tab { border:1px solid transparent; background:none; border-radius:999px; padding:5px 14px; color:var(--muted); }
+.tab[aria-selected="true"] { background:var(--accent-soft); border-color:var(--accent); color:var(--ink); font-weight:600; } .tab small { color:var(--muted); font-weight:400; margin-left:6px; }
+main { max-width:1100px; margin:0 auto; padding:18px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:14px 16px; margin-bottom:14px; }
+.card.draft { border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+.head { display:flex; align-items:center; gap:6px; margin-bottom:8px; }
+.sec { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); flex:1; display:flex; align-items:center; gap:4px; }
+.record { font:14px/1.9 var(--mono); padding:10px 14px; border-radius:10px; background:var(--soft); white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; cursor:text; max-height:230px; overflow:auto; }
+.m { border-radius:5px; padding:1px 2px; box-shadow:inset 0 -2px 0 var(--c); background:color-mix(in srgb, var(--c) 20%, transparent); }
+.m::after { content:attr(data-name); font:700 10px system-ui; margin-left:4px; color:var(--c); filter:brightness(.85); user-select:none; }
+.m.exists { background:none; box-shadow:inset 0 -2px 0 var(--muted); } .m.exists::after { color:var(--muted); }
+.m.draft { --c:var(--accent); background:color-mix(in srgb, var(--accent) 26%, transparent); outline:2px dashed var(--accent); outline-offset:1px; }
+.m.cand { background:none; box-shadow:inset 0 -2px 0 var(--line); cursor:pointer; } .m.cand::after { content:""; } .m.cand:hover { background:var(--accent-soft); box-shadow:inset 0 -2px 0 var(--accent); }
+.recrow { display:flex; align-items:center; gap:8px; margin-top:10px; color:var(--muted); font-size:12px; flex-wrap:wrap; }
+.recrow code { font:12px var(--mono); background:var(--soft); padding:2px 8px; border-radius:6px; color:var(--ink); }
+.namerow { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+.name { flex:1 1 200px; min-width:160px; border:1px solid var(--line); background:var(--soft); color:var(--ink); border-radius:10px; padding:8px 12px; font:600 15px var(--mono); }
+.name:focus { outline:2px solid var(--accent); } .name.bad { outline:2px solid var(--bad); }
+.typebtn { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); background:var(--soft); border-radius:10px; padding:8px 12px; }
+.typebtn:hover { border-color:var(--accent); } .typebtn small { color:var(--muted); }
+.sugg { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:10px; font-size:12px; color:var(--muted); }
+.sugg button { border:1px solid var(--line); background:none; border-radius:999px; padding:2px 10px; font:12px var(--mono); } .sugg button:hover { border-color:var(--accent); background:var(--accent-soft); }
+.opts { display:grid; gap:4px; max-height:230px; overflow:auto; margin-bottom:10px; }
+.opt { display:grid; grid-template-columns:18px 1fr auto; gap:10px; align-items:center; text-align:left; border:1px solid var(--line); background:none; border-radius:10px; padding:7px 10px; }
+.opt:hover { border-color:var(--accent); } .opt[aria-checked="true"] { border-color:var(--accent); background:var(--accent-soft); }
+.opt .rd { width:14px; height:14px; border-radius:50%; border:2px solid var(--muted); } .opt[aria-checked="true"] .rd { border-color:var(--accent); background:radial-gradient(var(--accent) 45%, transparent 50%); }
+.opt b { font-weight:600; } .opt code { display:block; font:11px var(--mono); color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:560px; }
+.opt .why { display:block; font-size:12px; color:var(--muted); margin:1px 0 2px; }
+.badges { display:flex; gap:4px; flex-wrap:wrap; margin:2px 0; } .bd { font-size:10px; border:1px solid var(--line); border-radius:999px; padding:0 7px; color:var(--muted); } .bd.ok { color:var(--ok); border-color:color-mix(in srgb, var(--ok) 40%, transparent); } .bd.warn { color:var(--warn); border-color:color-mix(in srgb, var(--warn) 40%, transparent); }
+.opt .ex { font:11px var(--mono); color:var(--muted); display:block; }
+.cov { font-size:11px; border-radius:999px; padding:1px 9px; background:color-mix(in srgb, var(--ok) 16%, transparent); color:var(--ok); white-space:nowrap; } .cov.mid { background:color-mix(in srgb, var(--warn) 16%, transparent); color:var(--warn); } .cov.low { background:color-mix(in srgb, var(--bad) 16%, transparent); color:var(--bad); }
+.rec { font-size:10px; border-radius:999px; padding:0 7px; margin-left:6px; background:var(--accent); color:#fff; }
+.seg { display:inline-flex; border:1px solid var(--line); border-radius:9px; overflow:hidden; } .seg button { border:0; background:none; padding:4px 14px; color:var(--muted); } .seg button[aria-pressed="true"] { background:var(--accent-soft); color:var(--ink); font-weight:600; }
+textarea.expr { width:100%; min-height:56px; resize:vertical; border:1px solid var(--line); background:var(--soft); color:var(--ink); border-radius:10px; padding:10px 12px; font:14px/1.5 var(--mono); } textarea.expr:focus { outline:2px solid var(--accent); }
+.status { display:flex; align-items:center; gap:8px; margin-top:6px; font-size:12px; color:var(--muted); } .status.bad { color:var(--bad); }
+.empty { color:var(--muted); display:flex; align-items:center; gap:8px; }
+.dock { position:fixed; left:0; right:0; bottom:0; background:var(--panel); border-top:1px solid var(--line); box-shadow:0 -8px 24px rgba(20,28,45,.12); padding:8px 18px 12px; max-height:230px; overflow:auto; }
+.dock .in { max-width:1100px; margin:0 auto; }
+table { border-collapse:collapse; width:100%; font-size:13px; }
+th, td { padding:6px 12px; text-align:left; border-bottom:1px solid var(--line); white-space:nowrap; max-width:380px; overflow:hidden; text-overflow:ellipsis; }
+th { font-weight:650; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; position:sticky; top:0; background:var(--panel); z-index:1; }
+tbody tr { cursor:context-menu; } tbody tr:hover td { background:var(--soft); }
+tr.draftrow td { background:color-mix(in srgb, var(--accent) 14%, transparent) !important; font-weight:600; }
+td .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; background:var(--c); } td .tag { font-size:10px; color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:0 7px; margin-left:8px; font-weight:400; } td .tag.new { color:var(--accent); border-color:var(--accent); }
+td.ex { font-family:var(--mono); font-size:12px; color:var(--muted); font-weight:400; } td.ty { cursor:pointer; } td.ty:hover { color:var(--accent); } td.nm { cursor:text; }
+td input { font:inherit; border:1px solid var(--accent); background:var(--soft); color:var(--ink); border-radius:6px; padding:1px 6px; width:170px; }
+.menu { position:fixed; z-index:50; min-width:250px; max-width:340px; background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); padding:5px; }
+.menu .t { font-size:11px; color:var(--muted); padding:5px 10px; max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.menu button { display:flex; width:100%; gap:10px; align-items:center; border:0; background:none; border-radius:8px; padding:7px 10px; text-align:left; } .menu button:hover { background:var(--accent-soft); } .menu button.first { font-weight:650; } .menu button svg { color:var(--muted); } .menu hr { border:0; border-top:1px solid var(--line); margin:4px 2px; }
+.seltip { position:fixed; z-index:60; display:inline-flex; align-items:center; gap:6px; border:0; border-radius:999px; background:var(--ink); color:var(--bg); padding:6px 14px; font-weight:600; box-shadow:var(--shadow); }
+.seltip:hover { background:var(--accent); color:#fff; }
+.toast { position:fixed; left:50%; bottom:250px; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:8px 16px; border-radius:999px; z-index:70; font-size:13px; }
+dialog { border:1px solid var(--line); border-radius:18px; background:var(--panel); color:var(--ink); width:min(540px,calc(100vw - 24px)); padding:20px 22px; box-shadow:var(--shadow); }
+dialog::backdrop { background:rgba(10,14,24,.45); } dialog h2 { font-size:16px; margin:0 0 10px; } dialog p { margin:0 0 10px; color:var(--muted); }
+dialog input.q { display:block; width:100%; margin:0 0 8px; border:1px solid var(--line); background:var(--soft); color:var(--ink); border-radius:8px; padding:7px 10px; }
+dialog .row { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; } dialog code { font:12px var(--mono); background:var(--soft); padding:1px 6px; border-radius:5px; }
+.tp { max-height:52vh; overflow:auto; } .tp h3 { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:12px 0 4px; }
+.tp button { display:flex; width:100%; justify-content:space-between; gap:10px; text-align:left; border:0; background:none; border-radius:8px; padding:6px 10px; } .tp button:hover { background:var(--accent-soft); } .tp button[aria-current="true"] { background:var(--accent-soft); font-weight:650; } .tp small { color:var(--muted); font:11px var(--mono); }
+.tag-proto { position:fixed; left:50%; transform:translateX(-50%); top:1px; font-size:10px; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; opacity:.7; pointer-events:none; }
+@media (prefers-reduced-motion: reduce) { * { transition:none !important; animation:none !important; } }
+</style>
+</head>
+<body>
+<span class="tag-proto">protótipo · dados simulados</span>
+<header class="top">
+  <h1>Colunas</h1><div class="tabs" id="tabs" role="tablist"></div><span class="grow"></span>
+  <button class="ib" id="undo" type="button" title="Desfazer" aria-label="Desfazer"></button>
+  <button class="ib" data-info="geral" type="button" title="Como usar" aria-label="Como usar"></button>
+  <button class="ib" id="theme" type="button" title="Tema" aria-label="Tema"></button>
+  <button class="btn primary" id="apply" type="button"></button>
+</header>
+<main>
+  <div class="card">
+    <div class="head"><div class="sec">Amostra <button class="i" data-info="amostra" type="button" aria-label="Mais informações"></button></div>
+      <button class="ib" id="prev" type="button" aria-label="Anterior"></button><small id="pos" style="color:var(--muted)"></small><button class="ib" id="next" type="button" aria-label="Próxima"></button></div>
+    <div class="record" id="record" tabindex="0"></div>
+    <div class="recrow"><span>Registro começa com</span><code id="start"></code><button class="ib" id="start-edit" type="button" title="Definir o que é um registro" aria-label="Definir o que é um registro"></button><button class="i" data-info="registro" type="button" aria-label="Mais informações"></button></div>
+  </div>
+  <div class="card" id="newcard"></div>
+</main>
+<div class="dock"><div class="in">
+  <div class="head"><div class="sec">Colunas <button class="i" data-info="tabela" type="button" aria-label="Mais informações"></button></div></div>
+  <table><thead><tr><th>Coluna</th><th>Tipo</th><th>Exemplos</th></tr></thead><tbody id="rows"></tbody></table>
+</div></div>
+<button class="seltip" id="seltip" type="button" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.2 5.3L20 10l-5.8 1.7L12 17l-2.2-5.3L4 10l5.8-1.7z"/></svg>Criar coluna</button>
+<div class="menu" id="menu" hidden></div><div class="toast" id="toast" hidden role="status"></div>
+<dialog id="dlg"></dialog>
+
+<script>
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const IC = { info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>', check:'<path d="M5 12l5 5 9-10"/>', x:'<path d="M6 6l12 12M18 6L6 18"/>', moon:'<path d="M20 14a8 8 0 1 1-9-10 6 6 0 0 0 9 10z"/>', undo:'<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>', left:'<path d="M15 6l-6 6 6 6"/>', right:'<path d="M9 6l6 6-6 6"/>', edit:'<path d="M4 20h4L19 9l-4-4L4 16z"/>', col:'<rect x="4" y="5" width="16" height="14" rx="2"/><path d="M10 5v14M4 11h16"/>', trash:'<path d="M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13"/>', type:'<path d="M5 6V4h14v2M12 4v16M9 20h6"/>', copy:'<rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>', plus:'<path d="M12 5v14M5 12h14"/>', search:'<circle cx="11" cy="11" r="6"/><path d="M20 20l-4-4"/>' };
+const svg = n => `<svg viewBox="0 0 24 24" aria-hidden="true">${IC[n]}</svg>`;
+
+// ---------- catálogo de tipos (referências: ECS, padrões Grok, Splunk CIM) ----------
+// b = tipo base da conversão; re = como o valor se parece; tok = padrão Grok pronto (quando existe)
+const TYPES = [
+  { id:"texto", g:"Básicos", l:"Texto", b:"texto", ex:"abc" }, { id:"inteiro", g:"Básicos", l:"Inteiro", b:"inteiro", re:"-?\\d+", tok:"INT", ex:"42" },
+  { id:"decimal", g:"Básicos", l:"Decimal", b:"decimal", re:"-?\\d+\\.\\d+", tok:"NUMBER", ex:"12.5" }, { id:"booleano", g:"Básicos", l:"Verdadeiro/falso", b:"booleano", re:"(?:true|false|sim|não|yes|no)", ex:"true" },
+  { id:"iso", g:"Data e hora", l:"Data e hora ISO 8601", b:"data-hora", re:"\\d{4}-\\d\\d-\\d\\d[T ]\\d\\d:\\d\\d:\\d\\d(?:[.,]\\d+)?(?:Z|[+-]\\d\\d:?\\d\\d)?", tok:"TIMESTAMP_ISO8601", ex:"2026-10-23 17:05:09" },
+  { id:"httpdate", g:"Data e hora", l:"Data e hora de log HTTP", b:"data-hora", re:"\\d\\d/[A-Z][a-z]{2}/\\d{4}:\\d\\d:\\d\\d:\\d\\d [+-]\\d{4}", tok:"HTTPDATE", ex:"23/Oct/2026:17:05:09 +0000" },
+  { id:"syslogdate", g:"Data e hora", l:"Data e hora de syslog", b:"data-hora", re:"[A-Z][a-z]{2} +\\d{1,2} \\d\\d:\\d\\d:\\d\\d", tok:"SYSLOGTIMESTAMP", ex:"Oct 23 17:05:09" },
+  { id:"epoch_ms", g:"Data e hora", l:"Epoch em milissegundos", b:"data-hora", re:"\\d{13}", ex:"1729702509123" }, { id:"epoch_s", g:"Data e hora", l:"Epoch em segundos", b:"data-hora", re:"\\d{10}", ex:"1729702509" },
+  { id:"data_br", g:"Data e hora", l:"Data dd/mm/aaaa", b:"data-hora", re:"\\d\\d/\\d\\d/\\d{4}", ex:"23/10/2026" }, { id:"hora", g:"Data e hora", l:"Hora hh:mm:ss", b:"texto", re:"\\d\\d:\\d\\d:\\d\\d(?:[.,]\\d+)?", tok:"TIME", ex:"17:05:09" },
+  { id:"duracao", g:"Data e hora", l:"Duração (ms, s, min, h)", b:"decimal", re:"\\d+(?:\\.\\d+)?\\s?(?:ms|s|min|h)", ex:"12.5ms" },
+  { id:"ipv4", g:"Rede", l:"Endereço IPv4", b:"ip", re:"(?:\\d{1,3}\\.){3}\\d{1,3}", tok:"IP", ex:"10.0.0.5" }, { id:"ipv6", g:"Rede", l:"Endereço IPv6", b:"ip", re:"(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}", tok:"IP", ex:"2001:db8::1" },
+  { id:"cidr", g:"Rede", l:"Rede (CIDR)", b:"texto", re:"(?:\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}", ex:"10.0.0.0/8" }, { id:"porta", g:"Rede", l:"Porta", b:"inteiro", re:"\\d{1,5}", ex:"443" },
+  { id:"mac", g:"Rede", l:"Endereço MAC", b:"texto", re:"(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}", tok:"MAC", ex:"00:1a:2b:3c:4d:5e" }, { id:"url", g:"Rede", l:"URL", b:"texto", re:"[a-zA-Z][a-zA-Z0-9+.-]*://\\S+", tok:"URI", ex:"https://exemplo.com/a" },
+  { id:"dominio", g:"Rede", l:"Domínio", b:"texto", re:"(?:[a-z0-9-]+\\.)+[a-z]{2,}", tok:"HOSTNAME", ex:"exemplo.com" }, { id:"email", g:"Rede", l:"E-mail", b:"texto", re:"[\\w.+-]+@[\\w-]+(?:\\.[\\w-]+)+", tok:"EMAILADDRESS", ex:"ana@exemplo.com" },
+  { id:"metodo", g:"Web", l:"Método HTTP", b:"texto", re:"(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)", ex:"GET" }, { id:"status", g:"Web", l:"Código de resposta HTTP", b:"inteiro", re:"[1-5]\\d\\d", ex:"404" }, { id:"useragent", g:"Web", l:"User-agent", b:"texto", re:"Mozilla/[^\"]+", ex:"Mozilla/5.0 …" },
+  { id:"uuid", g:"Identificadores", l:"UUID / GUID", b:"texto", re:"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}", tok:"UUID", ex:"123e4567-e89b-12d3-a456-426614174000" },
+  { id:"md5", g:"Identificadores", l:"Hash MD5", b:"texto", re:"[0-9a-fA-F]{32}", ex:"d41d8cd9…" }, { id:"sha1", g:"Identificadores", l:"Hash SHA-1", b:"texto", re:"[0-9a-fA-F]{40}", ex:"da39a3ee…" }, { id:"sha256", g:"Identificadores", l:"Hash SHA-256", b:"texto", re:"[0-9a-fA-F]{64}", ex:"e3b0c442…" },
+  { id:"hex", g:"Identificadores", l:"Número hexadecimal", b:"texto", re:"0[xX][0-9a-fA-F]+", tok:"HEX", ex:"0x2a" }, { id:"sid", g:"Identificadores", l:"SID do Windows", b:"texto", re:"S-1-5-(?:\\d+-)+\\d+", ex:"S-1-5-21-…" }, { id:"pid", g:"Identificadores", l:"ID de processo (PID)", b:"inteiro", re:"\\d{1,7}", ex:"4242" },
+  { id:"winpath", g:"Arquivos e sistema", l:"Caminho do Windows", b:"texto", re:"[A-Za-z]:\\\\(?:[^\\\\/:*?\"<>|\\r\\n]+\\\\)*[^\\\\/:*?\"<>|\\r\\n]*", tok:"WINPATH", ex:"C:\\Windows\\cmd.exe" }, { id:"unixpath", g:"Arquivos e sistema", l:"Caminho Unix", b:"texto", re:"(?:/[\\w.-]+)+", tok:"UNIXPATH", ex:"/var/log/app.log" },
+  { id:"arquivo", g:"Arquivos e sistema", l:"Nome de arquivo", b:"texto", re:"[\\w.-]+\\.[A-Za-z0-9]{1,5}", ex:"app.log" }, { id:"usuario", g:"Arquivos e sistema", l:"Usuário", b:"texto", re:"[\\w.-]+", tok:"USER", ex:"ana" }, { id:"dominiouser", g:"Arquivos e sistema", l:"Domínio\\Usuário", b:"texto", re:"[\\w.-]+\\\\[\\w.-]+", ex:"CORP\\ana" },
+  { id:"nivel", g:"Aplicação", l:"Nível de log", b:"texto", re:"(?:TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL)", tok:"LOGLEVEL", ex:"ERROR" }, { id:"classe", g:"Aplicação", l:"Classe Java", b:"texto", re:"(?:[a-z_][\\w$]*\\.)+[A-Z][\\w$]*", tok:"JAVACLASS", ex:"br.app.Pedido" },
+  { id:"excecao", g:"Aplicação", l:"Exceção Java", b:"texto", re:"(?:[a-z_][\\w$]*\\.)+[A-Z][\\w$]*(?:Exception|Error)", ex:"java.lang.IllegalStateException" }, { id:"semver", g:"Aplicação", l:"Versão (x.y.z)", b:"texto", re:"\\d+\\.\\d+\\.\\d+(?:-[\\w.]+)?", ex:"2.4.1" },
+  { id:"json", g:"Aplicação", l:"JSON", b:"texto", re:"\\{[^\\n]*\\}", ex:"{\"a\":1}" },
+  { id:"bytes", g:"Medidas", l:"Tamanho (B, KB, MB, GB)", b:"decimal", re:"\\d+(?:\\.\\d+)?\\s?(?:B|KB|MB|GB|TB)", ex:"12 MB" }, { id:"percent", g:"Medidas", l:"Porcentagem", b:"decimal", re:"\\d+(?:\\.\\d+)?%", ex:"92%" },
+  { id:"moeda", g:"Medidas", l:"Valor monetário", b:"decimal", re:"(?:R\\$|US\\$|\\$)\\s?\\d[\\d.,]*", ex:"R$ 12,50" }, { id:"latlon", g:"Medidas", l:"Latitude/longitude", b:"decimal", re:"-?\\d{1,3}\\.\\d{4,}", ex:"-23.5505" },
+];
+const T = id => TYPES.find(t => t.id === id) || TYPES[0];
+const SPECIFIC = ["ipv4","ipv6","cidr","mac","uuid","sha256","sha1","md5","iso","httpdate","syslogdate","email","url","winpath","unixpath","excecao","classe","dominiouser","semver","duracao","bytes","percent","moeda","hora","data_br","nivel","metodo","json","hex","sid","epoch_ms","epoch_s","status","decimal","inteiro","porta","booleano","dominio","arquivo"];
+
+// ---------- dados simulados ----------
+const TYPES_OF_LOG = {
+  http: { name:"Apache", pop:71000, start:"(uma linha por registro)", records:[
+    { raw:'10.0.0.5 - ana [23/Oct/2026:17:05:09 +0000] "GET /index.html HTTP/1.1" 200 5120', exists:{ clientip:"10.0.0.5", timestamp:"23/Oct/2026:17:05:09 +0000", verb:"GET", request:"/index.html", response:"200" } },
+    { raw:'192.168.1.20 - - [23/Oct/2026:17:05:11 -0300] "POST /api/login HTTP/1.1" 401 87', exists:{ clientip:"192.168.1.20", timestamp:"23/Oct/2026:17:05:11 -0300", verb:"POST", request:"/api/login", response:"401" } },
+    { raw:'10.0.0.7 - - [23/Oct/2026:17:06:00 +0000] "GET /missing HTTP/1.1" 404 -', exists:{ clientip:"10.0.0.7", timestamp:"23/Oct/2026:17:06:00 +0000", verb:"GET", request:"/missing", response:"404" } } ] },
+  java: { name:"Aplicação Java", pop:9400, start:"^\\d{4}-\\d\\d-\\d\\d ", records:[
+    { raw:"2026-10-23 17:05:09,120 ERROR [pool-3] br.app.Pedido - Falha ao salvar pedido 8841 (cliente 77) em 12.5ms\njava.lang.IllegalStateException: estoque zerado (sku 42) (lote A7) (filial 3)\n\tat br.app.Estoque.baixar(Estoque.java:88)\n\tat br.app.Pedido.salvar(Pedido.java:41)", exists:{ timestamp:"2026-10-23 17:05:09,120", level:"ERROR", thread:"pool-3", logger:"br.app.Pedido" } },
+    { raw:"2026-10-23 17:05:44,410 INFO [pool-1] br.app.Login - usuario=bruno entrou de 192.168.1.20 em 3ms", exists:{ timestamp:"2026-10-23 17:05:44,410", level:"INFO", thread:"pool-1", logger:"br.app.Login" } },
+    { raw:"2026-10-23 17:06:12,001 ERROR [pool-2] br.app.Pagamento - Timeout no gateway 10.0.0.9 (tentativa 3) em 250ms\njava.net.SocketTimeoutException: Read timed out (host gw-1) (porta 443) (filial 9)\n\tat br.app.Gateway.chamar(Gateway.java:130)", exists:{ timestamp:"2026-10-23 17:06:12,001", level:"ERROR", thread:"pool-2", logger:"br.app.Pagamento" } } ] },
+};
+const PALETTE = ["#2f7fd1","#e07a1f","#2b9a57","#b254c0","#c79a1b","#d4476a","#2aa79b","#7a6ee0"];
+const color = n => { let h = 7; for (const c of n) h = (h * 31 + c.charCodeAt(0)) >>> 0; return PALETTE[h % PALETTE.length]; };
+
+// ---------- estado ----------
+const S = { type:"java", idx:{}, mode:"grok", cols:{ http:[], java:[] }, draft:null };
+const hist = []; const snap = () => JSON.stringify({ cols:S.cols, draft:S.draft && { ...S.draft, cands:null } });
+const remember = () => hist.push(snap());
+function undo() { const s = hist.pop(); if (!s) return toast("Nada para desfazer"); const o = JSON.parse(s); S.cols = o.cols; S.draft = null; renderAll(); }
+const L = () => TYPES_OF_LOG[S.type];
+const idx = () => Math.min(S.idx[S.type] || 0, L().records.length - 1);
+const lit = x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+const allNames = () => [...Object.keys(L().records[0].exists), ...S.cols[S.type].map(c => c.name)];
+
+const lg = x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, " ");
+// ---------- motor de sugestões ----------
+// Para o trecho selecionado, combinamos "O QUE é o valor" (cores) com "ONDE ele está" (localizadores) e
+// VERIFICAMOS cada combinação: ela tem de devolver exatamente o trecho escolhido, na posição escolhida.
+// O que sobra é medido nas demais amostras (quantas encaixam, se acha uma só vez, se o formato é parecido)
+// e ordenado por confiança. Nenhuma sugestão chega à lista sem ter reproduzido a seleção.
+const OPEN = { "(":")", "[":"]", "{":"}", "<":">", '"':'"', "'":"'" };
+const PAIR_NAME = { "(":"parênteses", "[":"colchetes", "{":"chaves", "<":"sinais < >", '"':"aspas", "'":"aspas simples" };
+const ORD = n => n + "º", ORF = n => n + "ª";
+const KEYHINT = [[/ip|addr|host/i, "ipv4"], [/port/i, "porta"], [/pid/i, "pid"], [/status|code|resp/i, "status"], [/user|usuario|login|account/i, "usuario"], [/time|date|ts|when/i, "iso"], [/mail/i, "email"], [/url|uri|href/i, "url"], [/path|file|dir/i, "unixpath"], [/size|bytes|len/i, "bytes"], [/dur|elapsed|took|latency/i, "duracao"], [/lvl|level|sev/i, "nivel"]];
+const SEPS = { " ":["espaço","[ \\t]+","[^ \\t\\n]"], ",":["vírgula",",","[^,\\n]"], ";":["ponto e vírgula",";","[^;\\n]"], "|":["barra vertical","\\|","[^|\\n]"], "\t":["tabulação","\\t","[^\\t\\n]"] };
+function detectSep(line) { let best = null, n = 0; for (const s of Object.keys(SEPS)) { const c = line.split(s).length - 1; if (c > n && (s !== " " || c >= 2)) { best = s; n = c; } } return best; }
+const EXTRAS = { // partes de um valor reconhecido (cada uma traz a sua captura)
+  iso: [["Só a data", "(\\d{4}-\\d\\d-\\d\\d)(?=[T ]\\d)", "data"], ["Só a hora", "(?<=[T ])(\\d\\d:\\d\\d:\\d\\d)", "hora"], ["Data e hora sem milissegundos", "(\\d{4}-\\d\\d-\\d\\d[T ]\\d\\d:\\d\\d:\\d\\d)(?=[.,]\\d)", "quando"], ["Só o ano", "(\\d{4})(?=-\\d\\d-\\d\\d[T ])", "ano"], ["Só os milissegundos", "(?<=\\d\\d:\\d\\d:\\d\\d[.,])(\\d+)", "ms"]],
+  httpdate: [["Só a data", "(\\d\\d/[A-Z][a-z]{2}/\\d{4})(?=:)", "data"], ["Só a hora", "(?<=:)(\\d\\d:\\d\\d:\\d\\d)(?= [+-])", "hora"], ["Só o fuso", "(?<=\\d )([+-]\\d{4})", "fuso"]],
+  ipv4: [["Rede /24 do IP (3 primeiros números)", "((?:\\d{1,3}\\.){3})(?=\\d{1,3}\\b)", "rede"], ["Último número do IP", "(?<=(?:\\d{1,3}\\.){3})(\\d{1,3})", "host_id"], ["Primeiro número do IP", "(\\d{1,3})(?=(?:\\.\\d{1,3}){3})", "octeto1"]],
+  email: [["Usuário do e-mail (antes do @)", "([\\w.+-]+)(?=@)", "usuario"], ["Domínio do e-mail (depois do @)", "(?<=@)([\\w-]+(?:\\.[\\w-]+)+)", "dominio"]],
+  url: [["Domínio da URL", "(?<=://)([^/\\s:?]+)", "dominio"], ["Caminho da URL", "(?<=://[^/\\s]*)(/[^\\s?#]*)", "caminho"], ["Parâmetros da URL (depois do ?)", "(?<=\\?)(\\S+)", "parametros"], ["Protocolo da URL", "([a-zA-Z][a-zA-Z0-9+.-]*)(?=://)", "protocolo"]],
+  winpath: [["Nome do arquivo", "(?<=\\\\)([^\\\\\\s]+)(?=\\s|$)", "arquivo"], ["Pasta do arquivo", "([A-Za-z]:\\\\(?:[^\\\\\\s]+\\\\)*)(?=[^\\\\\\s]+(?:\\s|$))", "pasta"], ["Extensão", "\\.(\\w+)(?=\\s|$)", "extensao"], ["Unidade (C:, D:…)", "([A-Za-z]:)(?=\\\\)", "unidade"]],
+  unixpath: [["Nome do arquivo", "(?<=/)([^/\\s]+)(?=\\s|$)", "arquivo"], ["Pasta do arquivo", "((?:/[^/\\s]+)+)(?=/[^/\\s]+(?:\\s|$))", "pasta"], ["Extensão", "\\.(\\w+)(?=\\s|$)", "extensao"]],
+  duracao: [["Só o número (sem a unidade)", "(\\d+(?:\\.\\d+)?)(?=\\s?(?:ms|s|min|h)\\b)", "duracao"], ["Só a unidade", "(?<=\\d\\s?)(ms|s|min|h)\\b", "unidade"]],
+  bytes: [["Só o número (sem a unidade)", "(\\d+(?:\\.\\d+)?)(?=\\s?(?:B|KB|MB|GB|TB)\\b)", "tamanho"], ["Só a unidade", "(?<=\\d\\s?)(B|KB|MB|GB|TB)\\b", "unidade"]],
+  percent: [["Só o número (sem %)", "(\\d+(?:\\.\\d+)?)(?=%)", "percentual"]], moeda: [["Só o valor (sem o símbolo)", "(?<=(?:R\\$|US\\$|\\$)\\s?)(\\d[\\d.,]*)", "valor"]],
+  classe: [["Só o nome da classe (sem o pacote)", "(?<=\\.)([A-Z][\\w$]*)(?=\\b)", "classe"], ["Só o pacote", "((?:[a-z_][\\w$]*\\.)+)(?=[A-Z])", "pacote"]],
+  excecao: [["Só o nome da exceção (sem o pacote)", "(?<=\\.)([A-Z][\\w$]*(?:Exception|Error))", "excecao"]],
+  semver: [["Versão maior", "(\\d+)(?=\\.\\d+\\.\\d+)", "versao_maior"], ["Versão menor", "(?<=\\d\\.)(\\d+)(?=\\.\\d+)", "versao_menor"]],
+  uuid: [["Primeiro bloco do UUID", "([0-9a-fA-F]{8})(?=-)", "uuid8"]],
+  mac: [["Fabricante (3 primeiros pares)", "((?:[0-9a-fA-F]{2}[:-]){2}[0-9a-fA-F]{2})(?=[:-])", "oui"]],
+};
+const shapeOf = sel => { let out = "", i = 0; while (i < sel.length) { const c = sel[i]; if (/\d/.test(c)) { let j = i; while (/\d/.test(sel[j] || "")) j++; out += "\\d{" + (j - i) + "}"; i = j; } else if (/[A-Za-z]/.test(c)) { let j = i; while (/[A-Za-z]/.test(sel[j] || "")) j++; out += "[A-Za-z]{" + (j - i) + "}"; i = j; } else { out += lit(c); i++; } } return out; };
+const loose = sh => sh.replace(/\\d\{\d+\}/g, "\\d+").replace(/\[A-Za-z\]\{\d+\}/g, "[A-Za-z]+");
+const valueShape = v => v.replace(/\d+/g, "9").replace(/[A-Za-z]+/g, "a");
+const unitRe = x => x; // (o núcleo nunca tem grupos de captura)
+
+function analyze(rec, s, e) {
+  const sel = rec.slice(s, e), before = rec.slice(0, s), after = rec.slice(e), lines = rec.split("\n");
+  const lineIdx = before.split("\n").length - 1, ls = before.lastIndexOf("\n") + 1, nl = after.indexOf("\n"), le = nl < 0 ? rec.length : e + nl;
+  const line = rec.slice(ls, le), inLine = before.slice(ls), restLine = rec.slice(e, le);
+  const toks = (t, n, back) => { const m = t.trim().split(/\s+/).filter(Boolean); return back ? m.slice(-n) : m.slice(0, n); };
+  const o0 = before.slice(-1), isWrap = OPEN[o0] && after.startsWith(OPEN[o0]);
+  // vizinhos: sem contar o delimitador que já abraça a seleção
+  const prev = toks(isWrap ? inLine.slice(0, -1) : inLine, 3, true), next = toks(isWrap ? restLine.slice(1) : restLine, 3, false);
+  const key = (before.match(/([\w.-]{1,24})\s*[=:]\s*["']?$/) || [])[1];
+  const o = before.slice(-1), wrapped = OPEN[o] && after.startsWith(OPEN[o]) ? [o, OPEN[o]] : null;
+  const incl = OPEN[sel[0]] && sel.endsWith(OPEN[sel[0]]) && sel.length > 1 ? [sel[0], OPEN[sel[0]]] : null;
+  const tokS = ls + (inLine.search(/\S*$/)), tokE = e + (restLine.match(/^\S*/) || [""])[0].length, token = rec.slice(tokS, tokE);
+  return { sel, before, after, lines, lineIdx, nLines:lines.length, line, inLine, restLine, prev, next, key, wrapped, incl, token, partial:!/\s/.test(sel) && token !== sel && /\S/.test(token), multi:sel.includes("\n"),
+    atRecStart:!before.trim(), atRecEnd:!after.trim(), atLineStart:!inLine.trim(), atLineEnd:!restLine.trim(), sep:detectSep(line), words:sel.trim().split(/\s+/).length, firstTok:(line.trim().match(/^\S+/) || [""])[0] };
+}
+// ---- O QUE: núcleos (sem grupos de captura). base = estrutura que define uma "ocorrência" (ex.: os parênteses)
+function buildCores(c, rec, s, e, hint) {
+  const cores = [], add = x => cores.push(x), sel = c.sel;
+  const GENERIC = ["arquivo", "usuario", "porta", "pid", "dominio", "inteiro", "decimal", "booleano", "hex", "latlon"];
+  let hits = c.multi || c.partial ? [] : SPECIFIC.map(T).filter(t => t.re && new RegExp("^(?:" + t.re + ")$").test(sel));
+  if (hits.some(t => !GENERIC.includes(t.id))) hits = hits.filter(t => !GENERIC.includes(t.id) || t.id === hint);
+  hits.sort((a, b) => (b.id === hint) - (a.id === hint));
+  for (const t of hits.slice(0, 4)) { add({ id:t.id, label:t.l, src:t.re, tok:t.tok, custom:"TIPO_" + t.id.toUpperCase(), typeId:t.id, specific:true, rank:SPECIFIC.indexOf(t.id), names:ECS[t.id] || [], kind:"tipo" }); }
+  if (c.multi) {
+    add({ id:"restrec", label:"Até o fim do registro", src:"[\\s\\S]*", tok:"GREEDYDATA", typeId:"texto", rank:30, names:["detalhe"], kind:"bloco" });
+    add({ id:"block", label:"As mesmas linhas (bloco)", src:sel.split("\n").map(l => l.replace(/\S.*/, m => (/^(at|\bat)\b/.test(m) ? "at [^\\n]+" : "[^\\n]*"))).join("\\n"), tok:null, custom:"BLOCO", typeId:"texto", rank:25, names:["bloco"], kind:"bloco" });
+    if (/\n\s+at /.test(sel)) add({ id:"pilha", label:"As linhas “at …” (a pilha)", src:"(?:\\n[ \\t]+at [^\\n]+)+", custom:"PILHA", typeId:"texto", rank:2, names:["pilha"], kind:"bloco" });
+    if (/(Exception|Error)/.test(sel)) add({ id:"exc", label:"A linha da exceção", src:"[\\w.$]+(?:Exception|Error)[^\\n]*", custom:"EXCECAO_LINHA", typeId:"texto", rank:3, names:["excecao_linha"], kind:"bloco" });
+    return cores;
+  }
+  const pair = c.wrapped || null, inner = pair ? "[^" + lit(pair[1]) + "\\n]*" : "";
+  if (pair) {
+    add({ id:"inner", label:"Tudo entre " + pair[0] + " " + pair[1], src:inner, tok:"DATA", typeId:"texto", rank:3, names:[PAIR_NAME[pair[0]] === "aspas" ? "texto" : clean(PAIR_NAME[pair[0]])], kind:"delim", basePre:{ re:lit(pair[0]), gk:lg(pair[0]) }, basePost:{ re:lit(pair[1]), gk:lg(pair[1]) } });
+    if (/^\d+$/.test(sel)) add({ id:"innerint", label:"Só o número entre " + pair[0] + " " + pair[1], src:"\\d+", tok:"INT", typeId:"inteiro", rank:2, names:["numero"], kind:"delim", basePre:{ re:lit(pair[0]), gk:lg(pair[0]) }, basePost:{ re:lit(pair[1]), gk:lg(pair[1]) } });
+    if (/\s/.test(sel) && /^\S+\s/.test(sel)) { const w = sel.match(/^(\S+)\s+(.*)$/); add({ id:"innerwords", label:"Depois de “" + w[1] + "” entre " + pair[0] + " " + pair[1], src:"[^" + lit(pair[1]) + "\\n]*", tok:"DATA", typeId:"texto", rank:6, names:[clean(w[1])], kind:"delim", basePre:{ re:lit(pair[0]) + lit(w[1]) + "\\s+", gk:lg(pair[0] + w[1]) + " " }, basePost:{ re:lit(pair[1]), gk:lg(pair[1]) } }); }
+  }
+  if (c.incl) { const [o, cl] = c.incl; add({ id:"incl", label:"Com os " + o + " " + cl + " incluídos", src:lit(o) + "[^" + lit(cl) + "\\n]*" + lit(cl), custom:"COM_DELIMITADORES", typeId:"texto", rank:12, names:[clean(PAIR_NAME[o])], kind:"delim" }); const w = sel.slice(1, -1); if (/^\d+$/.test(w)) add({ id:"incl", label:"Só o número, sem os " + o + " " + cl, src:"\\d+", tok:"INT", typeId:"inteiro", rank:3, names:["numero"], kind:"delim", basePre:{ re:lit(o), gk:lg(o) }, basePost:{ re:lit(cl), gk:lg(cl) } }); }
+  if (c.key && !c.partial) { // o valor de uma chave
+    const q = /["']$/.test(c.before) && /^["']/.test(c.after), num = /^-?\d+(?:[.,]\d+)?$/.test(sel);
+    if (q) add({ id:"kvq", label:"Texto entre aspas", src:"[^\"\\n]*", tok:"DATA", typeId:"texto", rank:4, names:[clean(c.key)], kind:"valor", basePre:{ re:"\"", gk:"\"" }, basePost:{ re:"\"", gk:"\"" } });
+    add({ id:"kvs", label:"Valor até o espaço", src:"[^\\s,;)]+", tok:"NOTSPACE", typeId:"texto", rank:6, names:[clean(c.key)], kind:"valor" });
+    if (num) add({ id:"kvn", label:"Só o número", src:"-?\\d+(?:\\.\\d+)?", tok:"NUMBER", typeId:"decimal", rank:4, names:[clean(c.key)], kind:"valor" });
+    if (/\s/.test(sel)) add({ id:"kvl", label:"Valor até o fim da linha", src:"[^\\n]*", tok:"DATA", typeId:"texto", rank:20, names:[clean(c.key)], kind:"valor" });
+  }
+  if (/\s/.test(sel)) {
+    add({ id:"words", label:c.words + " palavras", src:"\\S+(?:[ \\t]+\\S+){" + (c.words - 1) + "}", custom:"PALAVRAS_" + c.words, typeId:"texto", rank:22, names:["texto"], kind:"texto" });
+    add({ id:"lazy", label:"Texto até a âncora seguinte", src:"[^\\n]+?", tok:"DATA", typeId:"texto", rank:12, names:["texto"], kind:"texto", lazy:true });
+    if (c.atLineEnd) add({ id:"eol", label:"Até o fim da linha", src:"[^\\n]*", tok:"DATA", typeId:"texto", rank:6, names:["mensagem"], kind:"texto" });
+    add({ id:"sent", label:"Uma frase (até o ponto)", src:"[^.\\n]+", custom:"FRASE", typeId:"texto", rank:16, names:["frase"], kind:"texto" });
+  }
+  if (!hits.length) {
+    const sh = shapeOf(sel); add({ id:"shape", label:"Mesmo formato", src:sh, custom:"FORMATO", typeId:"texto", rank:14, names:[clean(c.prev[c.prev.length - 1] || "") || "valor"], kind:"formato", note:sh });
+    if (loose(sh) !== sh) add({ id:"shapel", label:"Formato parecido (tamanhos livres)", src:loose(sh), custom:"FORMATO_LIVRE", typeId:"texto", rank:13, names:["valor"], kind:"formato" });
+    if (/^\d+$/.test(sel)) { add({ id:"digits", label:"Só dígitos", src:"\\d+", tok:"INT", typeId:"inteiro", rank:8, names:["numero"], kind:"classe" }); add({ id:"digitsn", label:sel.length + " dígitos", src:"\\d{" + sel.length + "}", custom:"DIGITOS_" + sel.length, typeId:"inteiro", rank:9, names:["numero"], kind:"classe" }); }
+    else if (/^[A-Za-z]+$/.test(sel)) { add({ id:"letters", label:"Só letras", src:"[A-Za-z]+", custom:"LETRAS", typeId:"texto", rank:9, names:["texto"], kind:"classe" }); if (/^[A-Z]+$/.test(sel)) add({ id:"upper", label:"Só maiúsculas", src:"[A-Z]+", custom:"MAIUSCULAS", typeId:"texto", rank:9, names:["texto"], kind:"classe" }); }
+    else if (/^\w+$/.test(sel)) add({ id:"word", label:"Letras, números e _", src:"\\w+", tok:"WORD", typeId:"texto", rank:10, names:["valor"], kind:"classe" });
+    if (/^[\w.-]+$/.test(sel)) add({ id:"ident", label:"Letras, números, ponto e traço", src:"[\\w.-]+", custom:"IDENTIFICADOR", typeId:"texto", rank:13, names:["valor"], kind:"classe" });
+    add({ id:"nosp", label:"Tudo até o próximo espaço", src:"\\S+", tok:"NOTSPACE", typeId:"texto", rank:12, names:["valor"], kind:"classe" });
+    if (c.sep && c.sep !== " ") add({ id:"nosep", label:"Tudo até o próximo " + SEPS[c.sep][0], src:SEPS[c.sep][2] + "+", custom:"CAMPO", typeId:"texto", rank:10, names:["campo"], kind:"classe" });
+    add({ id:"len", label:sel.length + " caracteres", src:"[^\\n]{" + sel.length + "}", custom:"CARACTERES_" + sel.length, typeId:"texto", rank:24, names:["valor"], kind:"classe" });
+  }
+  if (c.partial && !c.key) { // pedaço de uma palavra maior
+    const i = c.token.indexOf(sel), pfx = c.token.slice(0, i), sfx = c.token.slice(i + sel.length);
+    const d = /^\d+$/.test(sel), core = d ? "\\d+" : /^[A-Za-z]+$/.test(sel) ? "[A-Za-z]+" : "\\w+";
+    if (pfx) add({ id:"afterpfx", label:(d ? "Número" : "Parte") + " depois de “" + pfx + "”", src:core, tok:d ? "INT" : "WORD", typeId:d ? "inteiro" : "texto", rank:3, names:[clean(pfx) || "parte"], kind:"parte", basePre:{ re:lit(pfx), gk:lg(pfx) } });
+    if (sfx) add({ id:"beforesfx", label:(d ? "Número" : "Parte") + " antes de “" + sfx + "”", src:core, tok:d ? "INT" : "WORD", typeId:d ? "inteiro" : "texto", rank:4, names:[clean(sfx) || "parte"], kind:"parte", basePost:{ re:"(?=" + lit(sfx) + ")", gk:"(?=" + lg(sfx) + ")" } });
+    const parts = c.token.split(/[-_./:]/); if (parts.length > 1) { const sepc = c.token.match(/[-_./:]/)[0], k = c.token.slice(0, i).split(/[-_./:]/).length - 1; add({ id:"nthpart", label:ORD(k + 1) + " parte da palavra (separada por “" + sepc + "”)", src:"[^\\s" + lit(sepc) + "]+", custom:"PARTE", typeId:d ? "inteiro" : "texto", rank:5, names:["parte" + (k + 1)], kind:"parte", basePre:{ re:"(?<![^\\s])(?:[^\\s" + lit(sepc) + "]*" + lit(sepc) + "){" + k + "}", gk:"" } }); }
+    add({ id:"whole", label:"A palavra inteira (“" + c.token + "”)", src:"\\S+", tok:"NOTSPACE", typeId:"texto", rank:9, names:[clean(c.token.replace(/\d+/g, "")) || "palavra"], kind:"parte" });
+  }
+  // o mesmo valor, mas contando como "ocorrência" o que está entre os delimitadores (3º parênteses, 2º colchetes…)
+  if (pair) for (const k of cores.filter(k => !k.basePre && !k.basePost && ["formato", "classe", "texto", "valor"].includes(k.kind) && !k.lazy)) cores.push({ ...k, id:k.id + "_w", label:k.label + " entre " + pair[0] + " " + pair[1], basePre:{ re:lit(pair[0]), gk:lg(pair[0]) }, basePost:{ re:lit(pair[1]), gk:lg(pair[1]) }, rank:(k.rank ?? 50) - 1, kind:"delim" });
+  if (!cores.length) add({ id:"nosp", label:"Tudo até o próximo espaço", src:"\\S+", tok:"NOTSPACE", typeId:"texto", rank:12, names:["valor"], kind:"classe" });
+  return cores;
+}
+// ---- ONDE: localizadores. Recebem a "unidade" (como uma ocorrência se parece) e devolvem [pre, post, texto]
+const ND = x => "(?:" + x + ")";
+function buildLocators(c, unit, existing, bounded) {
+  const L2 = [], add = (pre, post, label, why, kind, w) => L2.push({ pre:pre || { re:"", gk:"" }, post:post || { re:"", gk:"" }, label, why, kind, w:w || 0 });
+  const raw = x => ({ re:x, gk:x }), litA = x => ({ re:lit(x) + "\\s+", gk:lg(x) + " " }), litB = x => ({ re:"(?=\\s*" + lit(x) + ")", gk:"(?= ?" + lg(x) + ")" });
+  const occRec = (n) => raw(ND("[\\s\\S]*?" + unit) + "{" + (n - 1) + "}[\\s\\S]*?");
+  const occLine = n => raw(ND("[^\\n]*?" + unit) + "{" + (n - 1) + "}[^\\n]*?");
+  const lineK = k => raw("(?:^|\\n)" + ND("[^\\n]*\\n") + "{" + (k - 1) + "}");
+  const lastRec = raw("(?![\\s\\S]*" + unit + ")"), lastLine = raw("(?![^\\n]*" + unit + ")");
+  const fromEndRec = k => raw("(?=" + ND("[\\s\\S]*?" + unit) + "{" + (k - 1) + "}(?![\\s\\S]*" + unit + "))");
+  const fromEndLine = k => raw("(?=" + ND("[^\\n]*?" + unit) + "{" + (k - 1) + "}(?![^\\n]*" + unit + "))");
+  const linesFromEnd = k => raw("(?=[^\\n]*" + ND("\\n[^\\n]*") + "{" + (k - 1) + "}$)");
+  // posição no registro
+  // quantas vezes a "unidade" aparece: se for comum demais, contar ocorrências não faz sentido (e é caro)
+  const whole = c.before + c.sel + c.after, occTotal = (() => { try { return [...whole.matchAll(new RegExp(unit, "g"))].length; } catch { return 99; } })(), many = occTotal > 6 || !bounded; // contar ocorrências de algo ilimitado ("tudo até o fim") é caro e sem sentido
+  add(null, null, "primeira ocorrência", "A primeira vez que aparece no registro", "pos", 4);
+  for (let n = 2; n <= 4 && !many; n++) add(occRec(n), null, ORD(n) + " do registro", "Sempre a " + n + "ª vez que aparece no registro", "pos", 5);
+  add(null, lastRec, "último do registro", "Sempre a última vez que aparece no registro", "pos", 6);
+  for (let k = 2; k <= 3 && !many; k++) add(null, fromEndRec(k), ORD(k) + " a partir do fim do registro", "A " + k + "ª vez contando do fim", "pos", 4);
+  // linha do registro
+  const li = c.lineIdx;
+  if (li >= 0) {
+    const inLineN = many ? 1 : [...c.inLine.matchAll(new RegExp(unit, "g"))].length + 1;
+    add(raw(lineK(li + 1).re + (inLineN > 1 ? occLine(inLineN).re : "[^\\n]*?")), null, (li === 0 ? "na 1ª linha" : "na " + (li + 1) + "ª linha") + (inLineN > 1 ? ", " + ORD(inLineN) + " da linha" : ""), "Na linha " + (li + 1) + " do registro" + (inLineN > 1 ? ", a " + inLineN + "ª ocorrência dela" : ""), "linha", 9);
+    if (c.nLines > 1) {
+      const fromEnd = c.nLines - li; add(raw("(?:^|\\n)[^\\n]*?"), raw(linesFromEnd(fromEnd).re), (fromEnd === 1 ? "na última linha" : "na " + ORF(fromEnd) + " linha contando do fim"), fromEnd === 1 ? "Sempre na última linha do registro" : "Linha " + fromEnd + " contando do fim", "linha", 8);
+      if (inLineN > 1) add(raw("(?:^|\\n)[^\\n]*?"), raw(linesFromEnd(fromEnd).re.slice(0, -2) + "$)"), "na " + ORD(fromEnd) + " linha do fim", "", "linha", 0);
+      add(raw("(?:^|\\n)[^\\n]*?"), raw(fromEndLine(1).re), "último da linha " + (li + 1), "O último desta linha", "linha", 5);
+    }
+    if (li === 0) { add(raw("^[^\\n]*?"), null, "na 1ª linha", "Só olha a primeira linha do registro", "linha", 8); if (inLineN > 1) add(raw("^" + occLine(inLineN).re), null, ORD(inLineN) + " da 1ª linha", "", "linha", 7); }
+    add(raw("(?:^|\\n)[^\\n]*?"), lastLine, "último da linha", "O último desta linha", "linha", 5);
+    for (let n = 2; n <= 3 && !many; n++) add(raw("(?:^|\\n)" + occLine(n).re), null, ORD(n) + " da linha", "A " + n + "ª vez dentro da linha", "linha", 5);
+    if (c.firstTok && c.nLines > 1 && c.lineIdx > 0) add(raw("(?:^|\\n)" + lit(c.firstTok) + "[^\\n]*?"), null, "na linha que começa com “" + c.firstTok.slice(0, 18) + "”", "A linha que começa com esta palavra", "linha", 11);
+    if (c.nLines > 1) { add(raw("(?:^|\\n)[^\\n]*?"), null, "em qualquer linha (a 1ª que encaixar)", "Procura em todas as linhas do registro", "linha", 1); }
+  }
+  // bordas
+  if (c.atRecStart) add(raw("^\\s*"), null, "no começo do registro", "Sempre o primeiro texto do registro", "borda", 10);
+  else if (c.atLineStart) add(raw("(?:^|\\n)[ \\t]*"), null, "no começo da linha", "Primeiro texto da linha", "borda", 8);
+  if (c.atRecEnd) add(null, raw("\\s*$"), "no fim do registro", "Sempre o último texto do registro", "borda", 10);
+  else if (c.atLineEnd) add(null, raw("[ \\t]*(?:$|\\n)"), "no fim da linha", "Último texto da linha", "borda", 8);
+  // vizinhança por texto fixo
+  const [p1, p2, p3] = [c.prev[c.prev.length - 1], c.prev[c.prev.length - 2], c.prev[c.prev.length - 3]], [n1, n2] = c.next;
+  if (c.key) { add(raw(lit(c.key) + "\\s*[=:]\\s*"), null, "valor de “" + c.key + "”", "O que vem depois de " + c.key + "=", "chave", 24); add(raw("\"" + lit(c.key) + "\"\\s*:\\s*"), null, "valor da chave JSON “" + c.key + "”", "Em JSON: \"" + c.key + "\": valor", "chave", 6); }
+  if (p1) add(litA(p1), null, "depois de “" + p1 + "”", "Logo depois da palavra " + p1, "vizinho", /\d/.test(p1) ? 5 : 14);
+  if (p1 && p2) add(raw(lit(p2) + "\\s+" + lit(p1) + "\\s+"), null, "depois de “" + p2 + " " + p1 + "”", "Depois das duas palavras " + p2 + " " + p1, "vizinho", 10);
+  if (p1 && p2 && p3) add(raw(lit(p3) + "\\s+" + lit(p2) + "\\s+" + lit(p1) + "\\s+"), null, "depois de “" + p3 + " " + p2 + " " + p1 + "”", "", "vizinho", 6);
+  if (n1 && !c.atLineEnd) add(null, litB(n1), "antes de “" + n1 + "”", "Logo antes da palavra " + n1, "vizinho", /\d/.test(n1) ? 4 : 11);
+  if (n1 && n2) add(null, raw("(?=\\s*" + lit(n1) + "\\s+" + lit(n2) + ")"), "antes de “" + n1 + " " + n2 + "”", "", "vizinho", 8);
+  if (p1 && n1) add(litA(p1), litB(n1), "entre “" + p1 + "” e “" + n1 + "”", "Entre duas palavras fixas do texto", "vizinho", 13);
+  const pc = c.before.slice(-1), nc = c.after.charAt(0);
+  if (pc && /[^\w\s]/.test(pc)) add(raw(lit(pc)), null, "depois de “" + pc + "”", "Logo depois deste símbolo", "vizinho", 9);
+  if (nc && /[^\w\s]/.test(nc)) add(null, raw("(?=" + lit(nc) + ")"), "antes de “" + nc + "”", "Logo antes deste símbolo", "vizinho", 9);
+  if (pc && nc && /[^\w\s]/.test(pc) && /[^\w\s]/.test(nc)) add(raw(lit(pc)), raw("(?=" + lit(nc) + ")"), "entre “" + pc + "” e “" + nc + "”", "Entre dois símbolos", "vizinho", 10);
+  // por posição de campo (separador)
+  if (c.sep) {
+    const [sn, sre, nots] = SEPS[c.sep], k = c.inLine.split(c.sep).length - 1, tot = c.line.split(c.sep).length;
+    if (c.sep !== " " || !c.partial) {
+      add(raw("(?:^|\\n)" + ND(nots + "*" + sre) + "{" + k + "}"), null, ORD(k + 1) + " campo (separado por " + sn + ")", "Sempre a posição " + (k + 1) + " da linha", "campo", 13);
+      add(null, raw(ND(sre + nots + "*") + "{" + (tot - k - 1) + "}[ \\t]*(?:$|\\n)"), ORD(tot - k) + " campo a partir do fim", "Contando do fim da linha", "campo", 9);
+    }
+  }
+  // por palavra
+  const wi = c.inLine.trim() ? c.inLine.trim().split(/\s+/).length : 0;
+  if (!c.multi) { add(raw("(?:^|\\n)" + ND("\\S+[ \\t]+") + "{" + wi + "}"), null, ORF(wi + 1) + " palavra da linha", "Sempre a palavra de posição " + (wi + 1), "palavra", 6); const tot = c.line.trim().split(/\s+/).length, back = tot - wi - c.words; if (back >= 0) add(null, raw(ND("[ \\t]+\\S+") + "{" + back + "}[ \\t]*(?:$|\\n)"), back === 0 ? "última palavra da linha" : ORF(back + 1) + " palavra a partir do fim", "Contando as palavras do fim da linha", "palavra", 4); }
+  // por deslocamento fixo
+  add(raw("(?:^|\\n)[^\\n]{" + c.inLine.length + "}"), null, "a partir do caractere " + (c.inLine.length + 1) + " da linha", "Posição fixa na linha", "posfixa", 2);
+  // relativo a outros valores já conhecidos
+  for (const x of existing) add(raw(x.re + "[^\\n]*?"), null, "depois de “" + x.name + "”", "Depois do campo " + x.name + " que já existe", "campo-existente", 3);
+  return L2;
+}
+function candidates(rec, s, e) {
+  const c = analyze(rec, s, e), hint = c.key && (KEYHINT.find(([re]) => re.test(c.key)) || [])[1];
+  const recs = L().records.map(r => r.raw);
+  const existing = []; for (const [n, v] of Object.entries(L().records[0].exists)) { const m = Object.entries(TYPES).length && SPECIFIC.map(T).find(t => t.re && new RegExp("^(?:" + t.re + ")$").test(v) && !["inteiro", "arquivo", "usuario", "porta", "pid", "dominio"].includes(t.id)); existing.push({ name:n, re: m ? m.re : lit(v.slice(0, 1)) + "\\S*" }); }
+  const raws = [], cores = buildCores(c, rec, s, e, hint);
+  const test = (re, mode) => { try { return [...rec.matchAll(new RegExp(re, "dg"))]; } catch { return null; } };
+  const out = [], seen = new Set();
+  const consider = (k) => {
+    if (seen.has(k.re)) return; seen.add(k.re);
+    const ms = test(k.re); if (!ms) return;
+    const first = ms[0], inSel = m => m && m.indices[1] && (m.indices[1][0] === s && m.indices[1][1] === e);
+    const hit = inSel(first) || (k.part && first && first.indices[1] && first.indices[1][0] >= s && first.indices[1][1] <= e ? first : null); // o motor extrai a 1ª ocorrência
+    if (!hit) return;                         // tem de devolver a seleção, na posição escolhida
+    const vals = recs.map(r => { try { const all = [...r.matchAll(new RegExp(k.re, "g"))]; return { first:all[0] ? all[0][1] : null, n:all.length }; } catch { return { first:null, n:0 }; } });
+    const ok = vals.filter(v => v.first != null), cnt = ms.length;
+    if (!ok.length) return;
+    const once = ok.every(v => v.n === 1), shapes = new Set(ok.map(v => valueShape(v.first)));
+    const stableAnchor = !/\d/.test((k.anchorText || ""));
+    out.push({ ...k, cover:ok.length, total:recs.length, values:vals.map(v => v.first), once, count:cnt, homog:shapes.size === 1, key:ok.map(v => v.first).join("\u0001") });
+  };
+  for (const core of cores) {
+    const unit = (core.basePre ? core.basePre.re : "") + core.src + (core.basePost ? core.basePost.re : "");
+    const bounded = (core.basePre && core.basePost) || !/\[\\s\\S\]\*|\[\^[^\]]*\]\*|\.\*|\*\?|\+\?|\\S\+\(\?:/.test(core.src);
+    const locs = buildLocators(c, unit, existing, bounded);
+    for (const lo of locs) {
+      if (core.lazy && !lo.post.re) continue;                // texto "até a âncora" precisa de âncora depois
+      // um valor que começa/termina em letra ou número não pode ser só um pedaço de outra palavra
+      const gPre = !core.basePre && /^\w/.test(c.sel) && core.kind !== "bloco" ? "(?<!\\w)" : "", gPost = !core.basePost && /\w$/.test(c.sel) && core.kind !== "bloco" ? "(?!\\w)" : "";
+      const pre = { re:lo.pre.re + (core.basePre ? core.basePre.re : "") + gPre, gk:lo.pre.gk + (core.basePre ? core.basePre.gk : "") }, post = { re:gPost + (core.basePost ? core.basePost.re : "") + lo.post.re, gk:(core.basePost ? core.basePost.gk : "") + lo.post.gk };
+      consider({ re:pre.re + "(" + core.src + ")" + post.re, core, lo, label:core.label + " · " + lo.label, why:lo.why ? lo.why + (core.kind === "tipo" ? " (" + core.label.toLowerCase() + ")" : "") : core.label, typeId:core.typeId, names:core.names, specific:!!core.specific, rank:core.rank ?? 50, group:lo.kind, kind:core.kind,
+        forms:name => ({ grok:pre.gk + "%{" + (core.tok || core.custom || "DATA") + ":" + name + "}" + post.gk, regex:pre.re + "(?<" + name + ">" + core.src + ")" + post.re, custom:core.tok ? null : (core.custom || "DATA") }), anchorText:(lo.label || "") });
+    }
+  }
+  // partes de um valor reconhecido (data → só a hora, caminho → nome do arquivo…)
+  const types = c.multi || c.partial ? [] : SPECIFIC.map(T).filter(t => t.re && new RegExp("^(?:" + t.re + ")$").test(c.sel));
+  for (const t of types.slice(0, 3)) for (const [lab, re, nm] of EXTRAS[t.id] || []) consider({ re, part:true, core:{ label:lab, kind:"parte", names:[nm] }, lo:{ kind:"parte", label:"" }, label:lab, why:"Uma parte do " + t.l.toLowerCase(), typeId:/Só o número|Só o valor|Último número|Primeiro número|Só o ano|milissegundos|Versão/i.test(lab) ? "inteiro" : "texto", names:[nm], specific:true, rank:SPECIFIC.indexOf(t.id) + 1, group:"parte", kind:"parte", forms:name => ({ grok:"%{FORMATO_" + nm.toUpperCase() + ":" + name + "}", regex:re.replace("(", "(?<" + name + ">"), custom:"FORMATO_" + nm.toUpperCase() }) });
+  // reserva: SEMPRE há ao menos uma forma de pegar exatamente este trecho (texto exato, texto ao redor, posição)
+  {
+    const q = x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), sel = c.sel, len = sel.length, bef = c.before, aft = c.after;
+    const nm = clean(c.prev[c.prev.length - 1] || "") || "valor", short = x => x.replace(/\n/g, "⏎").replace(/\t/g, "→");
+    const fb = (label, why, pre, core, post, custom) => consider({ re:pre + "(" + core + ")" + post, core:{ label, kind:"reserva", names:[nm] }, lo:{ kind:"reserva", label:"", w:-15 }, label:"Alternativa: " + label, why, typeId:"texto", names:[nm], specific:false, rank:60, group:"reserva", kind:"reserva", forms:name => ({ grok:pre + "%{" + custom + ":" + name + "}" + post, regex:pre + "(?<" + name + ">" + core + ")" + post, custom }) });
+    // o texto exato (na enésima vez que aparece)
+    const whole2 = bef + sel + aft, occs = [...whole2.matchAll(new RegExp(q(sel), "g"))], at = occs.findIndex(m => m.index === s);
+    if (at >= 0 && at <= 6) fb("sempre o texto “" + short(sel.slice(0, 30)) + (sel.length > 30 ? "…" : "") + "”" + (at ? " · " + (at + 1) + "ª vez" : ""), at ? "O texto exato, na " + (at + 1) + "ª vez que aparece no registro" : "O texto exato, quando ele aparecer", at ? "(?:[\\s\\S]*?" + q(sel) + "){" + at + "}[\\s\\S]*?" : "", q(sel), "", "TEXTO_EXATO");
+    // pelo texto exato que vem antes e/ou depois
+    for (const k of [3, 8, 16, 32, 64]) {
+      const b = bef.slice(-k), a = aft.slice(0, k); if (!b && !a) continue;
+      if (b) fb("mesmo tamanho (" + len + " caracteres) depois de “…" + short(b) + "”", "Os " + len + " caracteres que vêm logo depois do texto “" + short(b) + "”", q(b), "[\\s\\S]{" + len + "}", "", "MESMO_TAMANHO");
+      if (a) fb("tudo até “" + short(a) + "…”" + (b ? ", depois de “…" + short(b) + "”" : ""), "O que está entre " + (b ? "“" + short(b) + "”" : "o início") + " e “" + short(a) + "”", b ? q(b) : "^", "[\\s\\S]*?", "(?=" + q(a) + ")", "ENTRE_TEXTOS");
+    }
+    // pela posição no registro
+    fb("caracteres " + (s + 1) + " a " + e + " do registro", "Sempre nesta posição, contando do começo do registro", "^[\\s\\S]{" + s + "}", "[\\s\\S]{" + len + "}", "", "POSICAO_FIXA");
+    fb("os " + len + " caracteres, contando do fim do registro", "Sempre nesta posição, contando do fim do registro", "", "[\\s\\S]{" + len + "}", "[\\s\\S]{" + (whole2.length - e) + "}$", "POSICAO_DO_FIM");
+  }
+  // pontuação: confiança que o padrão vai pegar o mesmo tipo de coisa nas outras amostras
+  for (const k of out) {
+    const cov = k.cover / k.total, len = k.re.length;
+    k.score = cov * 40 + (k.once ? 14 : -8) + (k.homog ? 8 : 0) + (k.count === 1 ? 6 : 0) + (k.specific ? 34 - Math.min(k.rank, 30) : 18 - Math.min(k.rank, 18) / 2) + (k.lo.w || 0) - Math.min(14, len / 45) + (k.kind === "delim" ? 8 : 0) + (k.group === "chave" ? 10 : 0) + (k.group === "parte" ? 0 : 0);
+    k.names = (k.names || []).concat(c.key ? [clean(c.key)] : []);
+  }
+  out.sort((a, b) => b.score - a.score);
+  // equivalentes (mesmos valores nas amostras): fica o mais robusto e conta os demais
+  const bySig = new Map(), uniq = [];
+  for (const k of out) { const sig = k.key + "|" + k.kind + "|" + k.group + "|" + (k.lo && k.lo.label && /^(primeira|último|[0-9]º)/.test(k.lo.label) ? k.lo.label : ""); if (bySig.has(sig)) { bySig.get(sig).alts = (bySig.get(sig).alts || 0) + 1; continue; } bySig.set(sig, k); uniq.push(k); }
+  uniq.forEach((k, i) => k.rec = i === 0);
+  const res = uniq.slice(0, 40); res.total = out.length;
+  return res;
+}
+const exprOf = (c, name) => (S.mode === "grok" ? c.forms(name).grok : c.forms(name).regex);
+function reFromTyped(text) { // expressão digitada → RegExp (só protótipo: tokens Grok para regex)
+  let src = text.replace(/%\{(\w+)(?::(\w+))?\}/g, (_, t) => { const ty = TYPES.find(x => x.tok === t); const map = { WORD:"\\w+", NOTSPACE:"\\S+", DATA:".*?", GREEDYDATA:"[\\s\\S]*", INT:"-?\\d+", NUMBER:"-?\\d+(?:\\.\\d+)?", USER:"[\\w.-]+", HOSTNAME:"(?:[a-z0-9-]+\\.)+[a-z]{2,}", TIME:"\\d\\d:\\d\\d:\\d\\d" }; return `(${ty && !map[t] ? ty.re : map[t] || ".+?"})`; });
+  src = src.replace(/\(\?<(\w+)>/g, "("); return src;
+}
+// nomes sugeridos: chave antes, palavra anterior, tipo e nomes comuns (ECS)
+const ECS = { ipv4:["ip_origem","ip_destino","client.ip"], ipv6:["ip_origem","ip_destino"], iso:["quando","@timestamp"], httpdate:["quando"], email:["email","user.email"], url:["url","url.full"], status:["status","http.response.status_code"], metodo:["metodo","http.request.method"], usuario:["usuario","user.name"], winpath:["caminho","file.path"], unixpath:["caminho","file.path"], nivel:["nivel","log.level"], classe:["classe","log.logger"], duracao:["duracao","event.duration"], bytes:["bytes","http.response.bytes"], uuid:["id","event.id"], porta:["porta","destination.port"], pid:["pid","process.pid"], mac:["mac","source.mac"] };
+const clean = s => (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^\w.@]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase();
+function nameSuggestions(c) { const out = (c.names || []).map(clean); for (const n of ECS[c.typeId] || []) out.push(n); out.push(clean(T(c.typeId).l.split(" ")[0])); return [...new Set(out.filter(n => n && n.length > 1))].slice(0, 5); }
+const uniq = (n, except) => { const t = new Set(allNames().filter(x => x !== except)); let x = n, k = 2; while (t.has(x)) x = n + "_" + k++; return x; };
+
+// ---------- rascunho (nova coluna) ----------
+function startDraft(s, e) {
+  const rec = L().records[idx()].raw; if (e - s < 1) return;
+  const cands = candidates(rec, s, e); if (!cands.length) return toast("Nenhum padrão encaixa neste trecho");
+  const sg = nameSuggestions(cands[0]);
+  S.draft = { s, e, rec, cands, pick:0, name:uniq(sg[0] || "campo"), typeId:cands[0].typeId, typed:null, nameTouched:false, typeTouched:false };
+  renderAll(); const n = $("#nameinput"); if (n && !S.draft.nameTouched) { /* mantém a seleção do texto */ }
+}
+const cur = () => { const d = S.draft; return d && (d.typed != null ? { re:reFromTyped(d.typed), custom:true } : d.cands[d.pick]); };
+function pick(i) { const d = S.draft; d.pick = i; d.typed = null; if (!d.typeTouched) d.typeId = d.cands[i].typeId; if (!d.nameTouched) { const sg = nameSuggestions(d.cands[i]); d.name = uniq(sg[0] || "campo"); } renderAll(); }
+function commit() {
+  const d = S.draft; if (!d) return; const c = cur(); if (!d.name.trim()) return toast("Dê um nome à coluna");
+  if (allNames().includes(d.name)) return toast("Já existe uma coluna com esse nome");
+  remember();
+  const f = d.typed != null ? { grok:d.typed, regex:d.typed } : d.cands[d.pick].forms(d.name);
+  S.cols[S.type].push({ name:d.name, typeId:d.typeId, re:c.re, grok:f.grok, regex:f.regex, mode:S.mode });
+  S.draft = null; renderAll(); toast(`Coluna “${d.name}” criada`);
+}
+function valuesOf(re) { return L().records.map(r => { try { const m = new RegExp(re, "d").exec(r.raw); return m ? m[1] : null; } catch { return null; } }); }
+function rangeIn(re, rec) { try { const m = new RegExp(re, "d").exec(rec); return m && m.indices[1] ? m.indices[1] : null; } catch { return null; } }
+
+// ---------- render ----------
+function renderTabs() {
+  $("#tabs").innerHTML = Object.entries(TYPES_OF_LOG).map(([id, t]) => `<button class="tab" role="tab" data-t="${id}" aria-selected="${id === S.type}">${esc(t.name)}<small>${t.pop.toLocaleString("pt-BR")} registros</small></button>`).join("");
+  $("#tabs").querySelectorAll("[data-t]").forEach(b => b.onclick = () => { S.type = b.dataset.t; S.draft = null; renderAll(); });
+}
+function marks(rec) {
+  const out = [];
+  for (const [n, v] of Object.entries(rec.exists)) { const i = rec.raw.indexOf(v); if (i >= 0) out.push({ s:i, e:i + v.length, cls:"exists", name:n, c:"var(--muted)" }); }
+  for (const c of S.cols[S.type]) { const r = rangeIn(c.re, rec.raw); if (r) out.push({ s:r[0], e:r[1], cls:"col", name:c.name, c:color(c.name) }); }
+  if (S.draft) { const c = cur(), r = c && rangeIn(c.re, rec.raw); if (r) out.push({ s:r[0], e:r[1], cls:"draft", name:S.draft.name }); }
+  const taken = out.slice();
+  for (const t of ["ipv4", "iso", "classe", "excecao", "duracao", "uuid", "email", "url", "status", "semver", "bytes", "hex"]) { const re = new RegExp(T(t).re, "g"); for (const m of rec.raw.matchAll(re)) { const s = m.index, e = s + m[0].length; if (!taken.some(x => x.s < e && s < x.e) && !(t === "status" && !/" \d{3}$/.test(rec.raw.slice(0, e)))) { out.push({ s, e, cls:"cand", name:t, c:"var(--line)" }); taken.push({ s, e }); } } }
+  return out.sort((a, b) => a.s - b.s || (a.cls === "draft" ? -1 : 1)).filter((m, i, a) => !a.slice(0, i).some(x => x.e > m.s));
+}
+function renderRecord() {
+  const rec = L().records[idx()], ms = marks(rec); let html = "", cur2 = 0;
+  ms.forEach((m, i) => { html += esc(rec.raw.slice(cur2, m.s)) + `<span class="m ${m.cls}" data-i="${i}" data-name="${esc(m.cls === "cand" ? "" : m.name)}" style="--c:${m.c}">${esc(rec.raw.slice(m.s, m.e))}</span>`; cur2 = m.e; });
+  html += esc(rec.raw.slice(cur2));
+  const el = $("#record"); el.innerHTML = html; el._marks = ms;
+  $("#pos").textContent = `${idx() + 1}/${L().records.length}`; $("#prev").disabled = idx() === 0; $("#next").disabled = idx() >= L().records.length - 1; $("#start").textContent = L().start;
+  el.querySelectorAll(".m.cand").forEach(sp => sp.onclick = ev => { ev.stopPropagation(); const m = ms[+sp.dataset.i]; startDraft(m.s, m.e); });
+}
+function covClass(c) { return c.cover === c.total ? "" : c.cover === 0 ? "low" : "mid"; }
+function renderNew() {
+  const d = S.draft, box = $("#newcard"); box.className = "card" + (d ? " draft" : "");
+  if (!d) { box.innerHTML = `<div class="head"><div class="sec">Nova coluna <button class="i" data-info="nova" type="button" aria-label="Mais informações"></button></div></div><div class="empty">${svg("col")}<span>Selecione um trecho da amostra ou clique num pedaço sublinhado</span></div>`; box.querySelectorAll(".i").forEach(b => b.innerHTML = svg("info")); return; }
+  const sg = nameSuggestions(d.cands[d.pick]), ty = T(d.typeId), c = cur(), dup = allNames().includes(d.name);
+  box.innerHTML = `<div class="head"><div class="sec">Nova coluna <button class="i" data-info="nova" type="button" aria-label="Mais informações"></button></div>
+      <button class="ib" id="d-cancel" type="button" title="Cancelar" aria-label="Cancelar">${svg("x")}</button><button class="btn primary small" id="d-ok" type="button">${svg("check")}Adicionar</button></div>
+    <div class="namerow"><input class="name ${dup ? "bad" : ""}" id="nameinput" value="${esc(d.name)}" spellcheck="false" aria-label="Nome da coluna" placeholder="nome da coluna"><button class="typebtn" id="typebtn" type="button" aria-label="Escolher o tipo">${svg("type")}${esc(ty.l)}<small>${esc(ty.b)}</small></button></div>
+    <div class="sugg"><span>Nomes:</span>${sg.map(n => `<button type="button" data-n="${esc(n)}">${esc(n)}</button>`).join("")}</div>
+    <div class="head"><div class="sec">Padrões possíveis <span style="text-transform:none;letter-spacing:0;color:var(--muted)">· ${d.cands.length} verificados (de ${d.cands.total || d.cands.length} testados)</span> <button class="i" data-info="padroes" type="button" aria-label="Mais informações"></button></div></div>
+    <div class="opts" role="radiogroup" aria-label="Padrões possíveis">${d.cands.map((p, i) => i >= (d.all ? 40 : 8) && i !== d.pick ? "" : `<button class="opt" role="radio" aria-checked="${d.typed == null && i === d.pick}" data-p="${i}"><span class="rd"></span><span><b>${esc(p.label)}</b>${p.rec ? '<span class="rec">recomendado</span>' : ""}<span class="why">${esc(p.why || "")}</span><span class="badges">${p.once && p.cover === p.total ? '<span class="bd ok">estável</span>' : p.once ? "" : '<span class="bd warn">acha mais de um em alguma amostra</span>'}${p.homog ? '<span class="bd">formato parecido nas amostras</span>' : ""}${p.alts ? `<span class="bd">+${p.alts} equivalentes</span>` : ""}</span><code>${esc(exprOf(p, d.name || "campo"))}</code><span class="ex">${esc(p.values.filter(v => v != null).slice(0, 3).join("  ·  "))}</span></span><span class="cov ${covClass(p)}">${p.cover}/${p.total}</span></button>`).join("")}</div>
+    ${d.cands.length > 8 ? `<button class="btn small" id="more" type="button" style="margin-bottom:10px">${d.all ? "Mostrar só as melhores" : `Ver todas as ${d.cands.length} possibilidades verificadas`}</button>` : ""}
+    <div class="head"><div class="sec">Expressão</div><div class="seg" role="group" aria-label="Tipo de expressão"><button id="m-grok" aria-pressed="${S.mode === "grok"}">Grok</button><button id="m-regex" aria-pressed="${S.mode === "regex"}">Regex</button></div></div>
+    <textarea class="expr" id="expr" spellcheck="false" aria-label="Expressão">${esc(d.typed != null ? d.typed : exprOf(d.cands[d.pick], d.name || "campo"))}</textarea>
+    <div class="status" id="status"></div>`;
+  box.querySelectorAll(".i").forEach(b => b.innerHTML = svg("info"));
+  const stat = () => { const v = valuesOf(cur().re), ok = v.filter(x => x != null).length; $("#status").className = "status"; $("#status").innerHTML = `${svg("check")}<span>Encaixa em <b>${ok} de ${v.length}</b> amostras</span>`; }; stat();
+  $("#d-ok").onclick = commit; if ($("#more")) $("#more").onclick = () => { d.all = !d.all; renderAll(); }; $("#d-cancel").onclick = () => { S.draft = null; renderAll(); };
+  $("#nameinput").oninput = e => { d.name = e.target.value.trim().replace(/\s+/g, "_"); d.nameTouched = true; renderRows(); const x = $("#expr"); if (d.typed == null) x.value = exprOf(d.cands[d.pick], d.name || "campo"); box.querySelectorAll(".opt code").forEach((cd, i) => cd.textContent = exprOf(d.cands[i], d.name || "campo")); $("#nameinput").classList.toggle("bad", allNames().includes(d.name)); };
+  $("#nameinput").onkeydown = e => { if (e.key === "Enter") commit(); };
+  box.querySelectorAll("[data-n]").forEach(b => b.onclick = () => { d.name = b.dataset.n; d.nameTouched = true; renderAll(); });
+  box.querySelectorAll("[data-p]").forEach(b => b.onclick = () => pick(+b.dataset.p));
+  $("#typebtn").onclick = () => typePicker(d.typeId, id => { d.typeId = id; d.typeTouched = true; renderAll(); });
+  $("#m-grok").onclick = () => { S.mode = "grok"; renderAll(); }; $("#m-regex").onclick = () => { S.mode = "regex"; renderAll(); };
+  $("#expr").oninput = e => { d.typed = e.target.value; try { reFromTyped(d.typed); new RegExp(reFromTyped(d.typed)); } catch (er) { $("#status").className = "status bad"; $("#status").textContent = String(er.message || er); renderRecord(); renderRows(); return; } box.querySelectorAll(".opt").forEach(o => o.setAttribute("aria-checked", "false")); stat(); renderRecord(); renderRows(); };
+}
+function renderRows() {
+  const rows = [], recs = L().records;
+  if (S.draft) { const v = valuesOf(cur().re); rows.push(`<tr class="draftrow"><td><span class="dot" style="--c:var(--accent)"></span>${esc(S.draft.name || "(sem nome)")}<span class="tag new">novo</span></td><td>${esc(T(S.draft.typeId).l)}</td><td class="ex">${esc(v.filter(Boolean).slice(0, 3).join("  ·  "))}</td></tr>`); }
+  S.cols[S.type].forEach((c, i) => { const v = valuesOf(c.re); rows.push(`<tr data-c="${i}"><td class="nm" data-nm="${i}"><span class="dot" style="--c:${color(c.name)}"></span>${esc(c.name)}</td><td class="ty" data-ty="${i}">${esc(T(c.typeId).l)}</td><td class="ex">${esc(v.filter(Boolean).slice(0, 3).join("  ·  "))}</td></tr>`); });
+  for (const k of Object.keys(recs[0].exists)) rows.push(`<tr data-ex="1"><td><span class="dot" style="--c:var(--muted)"></span>${esc(k)}<span class="tag">já existe</span></td><td>${esc(T(/^\d+$/.test(recs[0].exists[k]) ? "inteiro" : "texto").l)}</td><td class="ex">${esc(recs.map(r => r.exists[k]).filter(Boolean).slice(0, 3).join("  ·  "))}</td></tr>`);
+  $("#rows").innerHTML = rows.join("");
+  $("#rows").querySelectorAll("[data-c]").forEach(tr => tr.oncontextmenu = e => { e.preventDefault(); rowMenu(+tr.dataset.c, e.clientX, e.clientY); });
+  $("#rows").querySelectorAll("[data-nm]").forEach(td => td.ondblclick = () => rename(+td.dataset.nm));
+  $("#rows").querySelectorAll("[data-ty]").forEach(td => td.onclick = () => { const c = S.cols[S.type][+td.dataset.ty]; typePicker(c.typeId, id => { remember(); c.typeId = id; renderAll(); }); });
+}
+function rename(i) {
+  const td = $(`[data-nm="${i}"]`), c = S.cols[S.type][i]; td.innerHTML = `<input value="${esc(c.name)}" aria-label="Novo nome">`; const inp = td.querySelector("input"); inp.focus(); inp.select();
+  const done = ok => { if (ok) { const n = clean(inp.value) || c.name; if (n !== c.name && allNames().includes(n)) { toast("Já existe uma coluna com esse nome"); } else if (n !== c.name) { remember(); c.name = n; } } renderAll(); };
+  inp.onkeydown = e => { if (e.key === "Enter") done(true); if (e.key === "Escape") done(false); }; inp.onblur = () => done(true);
+}
+function renderAll() { renderTabs(); renderRecord(); renderNew(); renderRows(); }
+
+// ---------- seleção, menus, diálogos ----------
+const menu = $("#menu");
+function showMenu(items, x, y, title) {
+  menu.innerHTML = (title ? `<div class="t">${esc(title)}</div>` : "") + items.map((it, i) => it === "-" ? "<hr>" : `<button type="button" data-i="${i}" class="${it.first ? "first" : ""}">${svg(it.icon || "col")}${esc(it.label)}</button>`).join("");
+  menu.hidden = false; menu.style.left = Math.max(8, Math.min(x, innerWidth - menu.offsetWidth - 8)) + "px"; menu.style.top = Math.max(8, Math.min(y, innerHeight - menu.offsetHeight - 8)) + "px";
+  menu.querySelectorAll("button").forEach(b => b.onclick = () => { const it = items[+b.dataset.i]; menu.hidden = true; it.run(); });
+}
+document.addEventListener("click", e => { if (!menu.contains(e.target)) menu.hidden = true; });
+document.addEventListener("keydown", e => { if (e.key === "Escape") menu.hidden = true; if ((e.ctrlKey || e.metaKey) && e.key === "z" && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)) { e.preventDefault(); undo(); } });
+function selection() { const sel = getSelection(), el = $("#record"); if (!sel || sel.isCollapsed || !el.contains(sel.anchorNode) || !el.contains(sel.focusNode)) return null; const at = (n, o) => { const r = document.createRange(); r.selectNodeContents(el); r.setEnd(n, o); return r.toString().length; }; let s = at(sel.anchorNode, sel.anchorOffset), e = at(sel.focusNode, sel.focusOffset); if (s > e) [s, e] = [e, s]; return s === e ? null : { s, e }; }
+// Selecionar o trecho já abre a lista de padrões possíveis.
+// Ao selecionar, aparece uma dica sobre o texto; só ao clicar nela os padrões são calculados.
+const tip = $("#seltip");
+function hideTip() { tip.hidden = true; }
+$("#record").addEventListener("mouseup", () => setTimeout(() => {
+  const sel = selection(); if (!sel) return hideTip();
+  const r = getSelection().getRangeAt(0).getBoundingClientRect();
+  tip._sel = sel; tip.hidden = false; tip.style.left = Math.max(8, Math.min(r.right - 20, innerWidth - tip.offsetWidth - 8)) + "px"; tip.style.top = Math.max(8, r.top - tip.offsetHeight - 8) + "px";
+}, 0));
+tip.addEventListener("mousedown", e => e.preventDefault());
+tip.onclick = () => { const sel = tip._sel; hideTip(); if (sel) startDraft(sel.s, sel.e); };
+document.addEventListener("selectionchange", () => { if (!selection()) hideTip(); });
+$("#record").addEventListener("contextmenu", ev => {
+  let sel = selection(); if (!sel) { const sp = ev.target.closest(".m"); if (sp) { const r = document.createRange(); r.selectNodeContents(sp.firstChild); getSelection().removeAllRanges(); getSelection().addRange(r); sel = selection(); } }
+  if (!sel) return; ev.preventDefault();
+  showMenu([{ label:"Criar coluna com este trecho", icon:"col", first:true, run:() => startDraft(sel.s, sel.e) }, { label:"Copiar", icon:"copy", run:() => toast("Copiado") }, "-", { label:"Desfazer", icon:"undo", run:undo }], ev.clientX, ev.clientY, `“${L().records[idx()].raw.slice(sel.s, sel.e).slice(0, 28)}”`);
+});
+function rowMenu(i, x, y) {
+  const c = S.cols[S.type][i];
+  showMenu([{ label:"Renomear", icon:"edit", first:true, run:() => rename(i) }, { label:"Tipo…", icon:"type", run:() => typePicker(c.typeId, id => { remember(); c.typeId = id; renderAll(); }) }, { label:"Copiar expressão", icon:"copy", run:() => toast("Copiado") }, "-", { label:"Remover coluna", icon:"trash", run:() => { remember(); S.cols[S.type].splice(i, 1); renderAll(); } }], x, y, c.name);
+}
+function typePicker(current, done) {
+  const d = $("#dlg"), groups = [...new Set(TYPES.map(t => t.g))];
+  const draw = q => { $("#tp").innerHTML = groups.map(g => { const list = TYPES.filter(t => t.g === g && (!q || (t.l + t.id + g).toLowerCase().includes(q))); return list.length ? `<h3>${esc(g)}</h3>` + list.map(t => `<button data-t="${t.id}" ${t.id === current ? 'aria-current="true"' : ""}><span>${esc(t.l)}</span><small>${esc(t.ex)}</small></button>`).join("") : ""; }).join("") || "<p>Nenhum tipo encontrado.</p>"; $("#tp").querySelectorAll("[data-t]").forEach(b => b.onclick = () => { d.close(); done(b.dataset.t); }); };
+  d.innerHTML = `<h2>Tipo da coluna</h2><input class="q" id="tq" placeholder="Buscar tipo…" aria-label="Buscar tipo" autocomplete="off"><div class="tp" id="tp"></div><div class="row"><button class="btn" onclick="$('#dlg').close()">Fechar</button></div>`; d.onclose = null; d.showModal(); draw(""); $("#tq").oninput = e => draw(e.target.value.toLowerCase()); $("#tq").focus();
+}
+const INFO = {
+  geral:["Como usar", "<p>Selecione um trecho da amostra (ou clique num pedaço sublinhado). O aplicativo propõe <b>padrões possíveis</b>: escolha um e veja a coluna nova, em destaque, na tabela.</p><p>Dê um nome, confira o tipo e clique em Adicionar.</p>"],
+  amostra:["Amostra", "<p>Cinza: campos que o aplicativo já reconhece. Colorido: colunas que você criou. Tracejado: a coluna em criação.</p>"],
+  registro:["O que é um registro", "<p>Alguns logs têm várias linhas por registro (como o stack trace do Java). O aplicativo detecta isso sozinho; se precisar, informe uma expressão que marque o <b>começo</b> de cada registro. Os padrões valem para o registro inteiro.</p>"],
+  nova:["Nova coluna", "<p>Cada coluna tem o seu próprio padrão. Você pode trocar o padrão pela lista, ou escrever a expressão (Grok ou Regex) e ver o resultado na hora.</p>"],
+  padroes:["Padrões possíveis", "<p>Combinamos <b>o que o valor é</b> (IP, data, palavra, formato do texto…) com <b>onde ele está</b> (começo ou fim da linha, depois de uma palavra, valor de uma chave, entre parênteses, antes de um texto…).</p><p>O número à direita é em quantas amostras o padrão encontra um valor. Quanto mais próximo do total, mais confiável.</p>"],
+  tabela:["Colunas", "<p>A coluna em criação aparece em destaque, no topo. Depois vêm as suas colunas e as que já existiam. Duplo clique no nome para renomear; clique no tipo para trocar.</p><p>Os tipos seguem referências como ECS (Elastic), os padrões Grok e o Splunk CIM.</p>"],
+};
+document.addEventListener("click", e => { const b = e.target.closest("[data-info]"); if (!b) return; const [t, body] = INFO[b.dataset.info]; const d = $("#dlg"); d.innerHTML = `<h2>${t}</h2>${body}<div class="row"><form method="dialog"><button class="btn">Fechar</button></form></div>`; d.onclose = null; d.showModal(); });
+function askText(title, value, done) { const d = $("#dlg"); d.innerHTML = `<form method="dialog"><h2>${esc(title)}</h2><input class="q" name="v" value="${esc(value)}" autocomplete="off"><div class="row"><button class="btn" value="no">Cancelar</button><button class="btn primary" value="ok">OK</button></div></form>`; d.onclose = () => { if (d.returnValue === "ok") done(d.querySelector("input").value); }; d.showModal(); d.querySelector("input").select(); }
+$("#start-edit").onclick = () => askText("Cada registro começa com (expressão regular)", L().start.startsWith("(") ? "" : L().start, v => { L().start = v || "(uma linha por registro)"; toast("O arquivo seria relido com esta definição"); renderAll(); });
+$("#prev").onclick = () => { S.idx[S.type] = idx() - 1; S.draft = null; renderAll(); }; $("#next").onclick = () => { S.idx[S.type] = idx() + 1; S.draft = null; renderAll(); };
+$("#undo").onclick = undo; $("#theme").onclick = () => { const r = document.documentElement; r.dataset.theme = (r.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")) === "dark" ? "light" : "dark"; };
+$("#apply").onclick = () => { const mine = S.cols[S.type]; if (!mine.length) return toast("Crie ao menos uma coluna"); const d = $("#dlg"); d.innerHTML = `<h2>Aplicar ao Caso</h2><p>${mine.map(c => `<code>norm.${esc(c.name)}</code>`).join(" ")}</p><div class="row"><form method="dialog"><button class="btn" value="no">Voltar</button><button class="btn primary" value="ok">Aplicar</button></form></div>`; d.onclose = () => { if (d.returnValue === "ok") toast("Aplicado ao Caso"); }; d.showModal(); };
+let tt; function toast(m) { const t = $("#toast"); t.textContent = m; t.hidden = false; clearTimeout(tt); tt = setTimeout(() => t.hidden = true, 2200); }
+for (const [s, n] of [["#undo", "undo"], ["[data-info=geral]", "info"], ["#theme", "moon"], ["#prev", "left"], ["#next", "right"], ["#start-edit", "edit"]]) document.querySelectorAll(s).forEach(b => b.innerHTML = svg(n));
+$("#apply").innerHTML = svg("check") + "Aplicar";
+renderAll();
+</script>
+</body>
+</html>

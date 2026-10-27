@@ -11,6 +11,7 @@
   "frontend-log-split.test.mjs",
   "frontend-local-explorer.test.mjs",
   "extraction-model.test.mjs",
+  "columns-engine.test.mjs",
   "frontend-native-case-startup.test.mjs",
   "frontend-native-evidence-association-save.test.mjs",
   "frontend-native-evidence-recovery.test.mjs",
