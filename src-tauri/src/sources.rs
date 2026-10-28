@@ -6,6 +6,8 @@ use chrono::Datelike;
 use serde_json::{Map, Value};
 
 mod generic;
+mod labeled;
+mod nmap;
 pub(crate) mod stamp;
 mod syslog;
 mod tokens;
@@ -19,7 +21,7 @@ mod xml_log;
 /// so all of them moved to a new revision; captured snapshots are evidence
 /// and never reparsed.
 pub(crate) fn parser_semantics_signature(format: &str) -> Option<&'static str> {
-    (format != "snapshot").then_some("universal-v5")
+    (format != "snapshot").then_some("universal-v6")
 }
 
 /// Any text parser may complete year-less or time-only values from the
@@ -998,6 +1000,11 @@ fn parse_auditd(line: &str) -> Option<Event> {
     Some(ev)
 }
 
+fn labeled_file(bytes: &[u8]) -> bool {
+    let lines: Vec<_> = bytes.split(|&b| b == b'\n').take(80).map(|line| decode_text(line.strip_suffix(b"\r").unwrap_or(line))).collect();
+    labeled::detect(&lines)
+}
+
 /// Inferência automática do formato pela amostra inicial do arquivo.
 pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
@@ -1128,6 +1135,9 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
         "logfmt"
     } else if let Some(format) = detect_positional(bytes) {
         format
+    } else if labeled_file(bytes) {
+        // Last of the dedicated readers: only text nothing else recognized (docs/formatos-de-log.md).
+        "labeled"
     } else if json + apache + nginx_error + logfmt + apache_error + s3164 + cef + leef > 0 {
         "mixed"
     } else {
@@ -1837,6 +1847,11 @@ fn delimited_layout(bytes: &[u8]) -> Option<(&'static str, usize)> {
 
 fn delimited_header(header: &str, rows: &[&str], strict: bool) -> Option<&'static str> {
     if rows.is_empty() || header.trim_start().starts_with(['{', '[', '#']) {
+        return None;
+    }
+    // `Time: 2026-10-12<TAB>User: ana` on every line is data with labels, not a header row: its
+    // "column names" would be the first record's values.
+    if labeled::pairs(header).is_some() && rows.iter().filter(|row| labeled::pairs(row).is_some()).count() * 10 >= rows.len() * 8 {
         return None;
     }
     let mut best: Option<(&'static str, usize)> = None;
@@ -3261,6 +3276,12 @@ pub(crate) fn parse_line_in(bytes: &[u8], format: &str, custom: Option<&CustomPa
             .or_else(|| parse_wildfly(text))
             .unwrap_or_else(|| universal(text, ctx)),
         "logfmt" => parse_logfmt(text).unwrap_or_else(|| universal(text, ctx)),
+        "labeled" => {
+            let mut ev = universal(text, ctx);
+            labeled::add_fields(&mut ev, text);
+            nmap::derive(&mut ev, text);
+            ev
+        }
         tabular if delimiter_of(tabular).is_some() => {
             let delimiter = delimiter_of(tabular).unwrap_or(',');
             // Preamble or comment lines of a tabular export are text, not a row.

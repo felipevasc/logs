@@ -5,6 +5,33 @@ primeiras linhas; cada linha que o leitor desse formato não reconhece passa
 pelos demais leitores e, por fim, pelo leitor genérico, que estrutura qualquer
 texto. O registro original (`raw`) é sempre preservado como foi gravado.
 
+## Princípio: evolução incremental
+
+O leitor precisa servir a **qualquer** log. Por isso toda melhoria de leitura segue estas regras, e
+nenhuma pode piorar o que já funciona para outro formato:
+
+1. **Só age onde hoje não há resultado.** Um detector novo entra depois de todos os existentes e só
+   reivindica arquivos que hoje cairiam em `text` ou `mixed`. Um arquivo com formato reconhecido não
+   muda de formato.
+2. **Exige evidência do arquivo inteiro**, não de uma linha (cerca de 80% das linhas com a mesma
+   forma, como na detecção de CSV). Uma linha avulsa continua indo para o leitor genérico.
+3. **Só acrescenta.** Nenhum campo existente é removido, renomeado ou muda de valor; campos novos
+   são adicionais. O registro original (`raw`) e os deslocamentos do índice não mudam.
+4. **Ferramentas e produtos entram como perfis de dados** (assinatura + mapeamento de campos) sobre
+   capacidades genéricas, não como código que só serve a um arquivo.
+5. **Regras de reconhecimento são estreitas.** Uma exceção (por exemplo, "isto é versão, não data")
+   descreve o caso exato e não toca nos formatos documentados.
+6. **Rede de segurança obrigatória.** A linha de base em
+   [`src-tauri/testdata/format-baseline.json`](../src-tauri/testdata/format-baseline.json) guarda,
+   para cada arquivo do corpus (`exemplos/*` e `src-tauri/testdata/corpus/*`), o formato detectado,
+   o nº de registros, as datas e um resumo dos campos. O teste `format_baseline` falha em qualquer
+   diferença. Uma mudança só é aceita quando a diferença é **a esperada** e aparece revisada no
+   diff do arquivo (regerar com `UPDATE_FORMAT_BASELINE=1 cargo test --lib format_baseline`).
+   Cada ajuste traz também testes negativos: linhas de outros formatos saem idênticas.
+7. **Custo de cache explícito.** Mudar o que um formato produz exige subir a revisão do leitor
+   (`parser_semantics_signature`) e reprocessa as fontes abertas uma vez; ajustes que só atingem
+   arquivos antes sem formato evitam isso quando possível.
+
 ## Data e hora
 
 Reconhecida em qualquer posição da linha (vence a primeira), nos campos JSON,
@@ -24,6 +51,11 @@ logfmt e colunas:
   CEST…) e nomes IANA comuns, com horário de verão europeu e americano. Sem fuso, vale o horário
   local da máquina — exceto em logs W3C do IIS e do CloudFront (campos `cs-`, `sc-`, `s-`), gravados
   em UTC por definição; o log do Firewall do Windows continua em horário local.
+
+Três números separados por ponto cujo último tem dois dígitos, sem hora (`Apache httpd 2.4.62`,
+`libxml 2.9.14`, `10.10.10.10`), são versão ou endereço, não data. Só esse formato é recusado;
+`12.10.2026`, `2026.10.12` e qualquer data com hora continuam datas. Linhas que começam por `#` ganham o
+campo `comentario` (continuam registros, para os números de linha não mudarem).
 
 Datas sem ano (syslog, klog, Android) ficam no ano atual. A data no nome do arquivo e a da última
 modificação não mudam o ano: um nome pode trazer qualquer dia do log e cópias alteram a
@@ -45,6 +77,8 @@ prioridade.
 | Segurança | CEF e LEEF (também após cabeçalho syslog), iptables/UFW, auditd, Zeek, Suricata/CloudTrail/Okta/Wazuh em JSON |
 | Aplicações | Log4j/Logback, JBoss/WildFly, Spring Boot, Python `logging`, Serilog, NLog, Rails, Elasticsearch, PostgreSQL, MySQL, Redis, MongoDB, Tomcat `catalina.out`, java.util.logging (duas linhas), PHP |
 | Plataformas | Kubernetes klog, prefixo CRI de contêiner (`stdout F`), Android logcat, Squid, AWS ALB/ELB, FortiGate e outros `chave=valor` |
+| Rótulo: valor | Registros de pares `Rótulo: valor` separados por tabulação ou por 2+ espaços (`Host: 10.0.0.1 (srv)<TAB>Ports: …`, `level: info  msg: ok`): cada par vira `label.<nome>` além da leitura genérica; só vale quando quase todas as linhas têm essa forma e a mesma abertura |
+| nmap `-oG` | Perfil sobre o formato acima: `destination.ip`, `host.name`, `nmap.status`, `nmap.ports` (lista com uma entrada por porta), `nmap.ports_open`, `nmap.open_count`/`closed_count`/`filtered_count`, `nmap.services`, `nmap.open`, `nmap.os`, e do cabeçalho `nmap.command`/`nmap.version` |
 | Tabular | CSV/TSV/`;`/`|` com cabeçalho (também após linhas de preâmbulo, como o log DHCP do Windows), sem cabeçalho (colunas `coluna N`), W3C/IIS/CloudFront |
 | JSON | JSONL, arrays, envelopes (`Records`, `value`, `hits`…), objetos seguidos sem array (inclusive formatados em várias linhas), JSON embutido no texto da mensagem, chaves de Serilog, journald, GELF, pino e log4j2; exportações interrompidas no meio mantêm todos os registros completos |
 | XML | Eventos do Windows salvos como XML (Visualizador de Eventos, `wevtutil /f:xml`, PowerShell), com a mensagem renderizada quando existe; log4j `XMLLayout`; java.util.logging `XMLFormatter`; qualquer arquivo de registros XML repetidos (o elemento do registro é descoberto no próprio arquivo) |

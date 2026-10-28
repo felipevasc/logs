@@ -1,0 +1,4 @@
+time	host	level	message
+2026-10-12 00:00:01	srv01	INFO	started
+2026-10-12 00:00:02	srv02	ERROR	disk full
+2026-10-12 00:00:03	srv01	WARN	slow response

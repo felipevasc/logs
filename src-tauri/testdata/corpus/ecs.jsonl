@@ -1,0 +1,3 @@
+{"@timestamp":"2026-10-12T00:00:01.000Z","log.level":"info","message":"started","host":{"name":"srv01"},"service.name":"api"}
+{"@timestamp":"2026-10-12T00:00:02.000Z","log.level":"error","message":"failed","host":{"name":"srv02"},"user":{"name":"ana"}}
+{"@timestamp":"2026-10-12T00:00:03.000Z","log.level":"warn","message":"slow","event":{"duration":1500000}}

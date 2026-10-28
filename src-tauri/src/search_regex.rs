@@ -437,12 +437,17 @@ impl Matcher {
     /// Byte ranges of the first occurrence: index 0 is the whole match, then every group
     /// (`None` = did not take part). Lean path for bulk extraction: no values, no UTF-16.
     pub(crate) fn first_ranges(&self, text: &str) -> Result<Option<Vec<Option<(usize, usize)>>>, String> {
+        self.ranges_from(text, 0)
+    }
+    /// `first_ranges` for the first occurrence at or after byte `start` of `text` (look-behind
+    /// still sees what precedes `start`).
+    fn ranges_from(&self, text: &str, start: usize) -> Result<Option<Vec<Option<(usize, usize)>>>, String> {
         if text.len() > SUBJECT_LIMIT {
             return Err("O registro excede 8 MiB. Busca incompleta; use um recorte menor.".into());
         }
         crate::operations::check()?;
         match &self.kind {
-            Kind::Fast(re) => Ok(re.captures(text).map(|cap| {
+            Kind::Fast(re) => Ok(re.captures_at(text, start).map(|cap| {
                 (0..cap.len()).map(|i| cap.get(i).map(|m| (m.start(), m.end()))).collect()
             })),
             Kind::Pcre(pcre) => unsafe {
@@ -468,7 +473,7 @@ impl Matcher {
                 pcre2_set_heap_limit_8(scratch.0, 8 * 1024);
                 let mut deadline = Deadline { until: Instant::now() + Duration::from_millis(100), ticks: 0 };
                 pcre2_set_callout_8(scratch.0, Some(callout), (&mut deadline as *mut Deadline).cast());
-                let rc = pcre2_match_8(pcre.code.as_ptr(), text.as_ptr(), text.len(), 0, 0, scratch.1, scratch.0);
+                let rc = pcre2_match_8(pcre.code.as_ptr(), text.as_ptr(), text.len(), start, 0, scratch.1, scratch.0);
                 if rc == PCRE2_ERROR_NOMATCH {
                     return Ok(None);
                 }
@@ -487,6 +492,19 @@ impl Matcher {
                 Ok(Some(ranges))
             },
         }
+    }
+    /// Every non-overlapping occurrence (at most `limit`), each as in `first_ranges`. An empty
+    /// match moves on by one character, so the loop always ends.
+    pub(crate) fn all_ranges(&self, text: &str, limit: usize) -> Result<Vec<Vec<Option<(usize, usize)>>>, String> {
+        let mut found = Vec::new();
+        let mut at = 0usize;
+        while at <= text.len() && found.len() < limit {
+            let Some(ranges) = self.ranges_from(text, at)? else { break };
+            let Some((a, b)) = ranges.first().copied().flatten() else { break };
+            at = if b > a { b } else { text[b..].chars().next().map_or(text.len() + 1, |c| b + c.len_utf8()) };
+            found.push(ranges);
+        }
+        Ok(found)
     }
     pub(crate) fn is_pcre2(&self) -> bool {
         matches!(self.kind, Kind::Pcre(_))

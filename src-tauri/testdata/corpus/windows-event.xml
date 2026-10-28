@@ -1,0 +1,4 @@
+<Events>
+<Event><System><Provider Name="Microsoft-Windows-Security-Auditing"/><EventID>4624</EventID><TimeCreated SystemTime="2026-10-12T00:00:01.000Z"/><Computer>pc01</Computer></System><EventData><Data Name="TargetUserName">ana</Data></EventData></Event>
+<Event><System><Provider Name="Microsoft-Windows-Security-Auditing"/><EventID>4625</EventID><TimeCreated SystemTime="2026-10-12T00:00:02.000Z"/><Computer>pc01</Computer></System><EventData><Data Name="TargetUserName">bruno</Data></EventData></Event>
+</Events>

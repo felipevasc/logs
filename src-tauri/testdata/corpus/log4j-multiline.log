@@ -1,0 +1,6 @@
+2026-10-12 00:00:01,120 ERROR [pool-3] br.app.Pedido - Falha ao salvar pedido 8841
+java.lang.IllegalStateException: estoque zerado
+	at br.app.Estoque.baixar(Estoque.java:88)
+	at br.app.Pedido.salvar(Pedido.java:41)
+2026-10-12 00:00:02,410 INFO [pool-1] br.app.Login - usuario=bruno entrou
+2026-10-12 00:00:03,001 WARN [pool-2] br.app.Pagamento - Timeout no gateway

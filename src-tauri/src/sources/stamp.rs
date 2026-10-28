@@ -932,6 +932,21 @@ fn complete(raw: Raw, epoch_ms: Option<i64>, start: usize, ctx: &Context) -> Opt
     Some(Found { ms, start, end: raw.end, inferred, has_time: raw.time.is_some(), zoned: offset.is_some() })
 }
 
+/// `2.4.62`, `1.2.13`, `10.10.10` (and the start of `10.1.30.4`): three dotted numbers whose last
+/// one has two digits read as `d.m.yy`, but without a time they are far more often a version or an
+/// address. Only this exact shape is refused, and only when it is not the first thing on the line
+/// or when more dotted digits follow; `12.10.2026`, `2026.10.12` and any date with a time are
+/// untouched.
+fn version_like(span: &[u8], rest: &[u8], inside_line: bool) -> bool {
+    let mut parts = span.split(|&b| b == b'.');
+    let (Some(a), Some(b), Some(c), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { return false };
+    let digits = |p: &[u8]| !p.is_empty() && p.iter().all(u8::is_ascii_digit);
+    if !(digits(a) && digits(b) && digits(c) && c.len() == 2) {
+        return false;
+    }
+    inside_line || (rest.first() == Some(&b'.') && rest.get(1).is_some_and(u8::is_ascii_digit))
+}
+
 /// The leftmost date/time in a line. A complete date and time wins over an
 /// earlier date without a time.
 pub(crate) fn find(text: &str, ctx: &Context) -> Option<Found> {
@@ -948,7 +963,7 @@ pub(crate) fn find(text: &str, ctx: &Context) -> Option<Found> {
                     if found.has_time {
                         return Some(found);
                     }
-                    if i < DATE_ONLY_LIMIT && date_only.is_none() {
+                    if i < DATE_ONLY_LIMIT && date_only.is_none() && !version_like(&s[i..found.end], &s[found.end..], i > lead) {
                         date_only = Some(found);
                     }
                 }
@@ -1086,6 +1101,29 @@ mod tests {
     }
     fn found(text: &str) -> Option<(i64, &str)> {
         find(text, &ctx()).map(|f| (f.ms, &text[f.start..f.end]))
+    }
+
+    #[test]
+    fn versions_and_addresses_are_not_dates_but_dotted_dates_still_are() {
+        for text in [
+            "Host: 10.0.0.1 ()\tPorts: 80/open/tcp//http//Apache httpd 2.4.62 ((Rocky Linux))/",
+            "Started service foo version 2.4.62 on port 80",
+            "Using libxml 2.9.14 and zlib 1.2.13",
+            "10.10.10.10 - - GET /",
+            "peer 10.1.30.4 closed",
+        ] {
+            assert!(found(text).is_none(), "{text}: {:?}", found(text));
+        }
+        // dotted dates the readers document, a date with a time, and a date that opens the line
+        for (text, span) in [
+            ("12.10.2026 service started", "12.10.2026"),
+            ("2026.10.12 08:01:02 x", "2026.10.12 08:01:02"),
+            ("12.10.26 00:00:04 legacy", "12.10.26 00:00:04"),
+            ("12.10.26 legacy two digit year at the start", "12.10.26"),
+            ("build 1.4.7 finished 12.10.2026 00:00:04", "12.10.2026 00:00:04"),
+        ] {
+            assert_eq!(found(text).map(|f| f.1), Some(span), "{text}");
+        }
     }
 
     #[test]

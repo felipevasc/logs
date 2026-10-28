@@ -73,6 +73,12 @@ arquivo; as colunas valem para a definição inteira).
    **reabre a fonte**: o enquadramento é do índice, então ele é refeito. A expressão é de uma linha
    física, na sintaxe Rust regex; linhas que não a casam continuam o registro anterior. As colunas
    leem o registro inteiro.
+   **Todas as ocorrências**: quando o padrão escolhido acha o valor mais de uma vez no registro (contado
+   pelo motor nativo, `map_verify` com `counts`), aparece a opção “Todas as ocorrências no registro”. Ligada, a
+   coluna vira Regex com `all: true` e guarda os valores juntos, separados por `, `, como texto
+   (até 200 por registro; o trecho destacado é o da primeira ocorrência). É a forma de tirar listas
+   — portas, endereços, nomes repetidos — sem perder nada. Para ter **uma linha por item**, use o SQL
+   (`unnest(string_split(campo, ', '))`; veja [SQL](exploracao-local.md#sql)).
 6. **Tabela de colunas** (sempre embaixo): Coluna, Tipo, Exemplos. A coluna em criação é a primeira
    linha, em destaque; depois as suas colunas e as que já existiam. Botão direito: renomear, tipo,
    editar o padrão, copiar a expressão, remover.
@@ -170,6 +176,10 @@ registro aceita até 128 saídas e 512 KiB.
 - Prévia: `node scripts/preview/serve.mjs` e `node scripts/preview/test-extraction.mjs`
   (motor simulado; a semântica nativa é coberta pelos testes Rust e
   `test-local-native.mjs`).
+- App real com o fixture do nmap: `node scripts/preview/test-nmap-native.mjs <loginsight.exe>` (formato
+  `Rótulo: valor`, sem datas falsas, SQL que expande listas em linhas e regex com todas as ocorrências).
+- Leitura de formatos: `cargo test --lib format_baseline` compara o corpus inteiro com
+  `src-tauri/testdata/format-baseline.json` (veja [Princípio: evolução incremental](formatos-de-log.md)).
 - Desempenho: `LOGINSIGHT_BENCH_LINES=1000000 cargo test --release --lib scan_benchmark
   -- --ignored --nocapture` imprime tamanho, registros, modo de build e taxas.
 

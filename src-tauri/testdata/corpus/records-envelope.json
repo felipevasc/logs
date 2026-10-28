@@ -1,0 +1,2 @@
+{"Records":[{"eventTime":"2026-10-12T00:00:01Z","eventSource":"s3.amazonaws.com","eventName":"GetObject","awsRegion":"us-east-1","sourceIPAddress":"203.0.113.5","userIdentity":{"type":"IAMUser","userName":"ana"}},
+{"eventTime":"2026-10-12T00:00:02Z","eventSource":"iam.amazonaws.com","eventName":"CreateUser","awsRegion":"us-east-1","sourceIPAddress":"198.51.100.7","userIdentity":{"type":"IAMUser","userName":"bruno"}}]}

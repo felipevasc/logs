@@ -60,10 +60,11 @@ window.ExtractionColumns = (() => {
     return { type: "text" };
   }
   function buildRule(name, m, example) {
-    const g = gname(name), spec = typeSpec(m.typeId, example);
-    const extract = m.mode === "grok" && m.grok != null
+    // Todas as ocorrências viram um texto só ("80, 443"); por isso sempre Regex e tipo texto.
+    const every = !!m.every, g = gname(name), spec = every ? { type: "text" } : typeSpec(m.typeId, example);
+    const extract = m.mode === "grok" && m.grok != null && !every
       ? { kind: "grok", patterns: [m.grok], anchor: "search", dot_all: true, source: "raw" }
-      : { kind: "regex", pattern: m.regex, engine: "pcre2", case_sensitive: true, source: "raw" };
+      : { kind: "regex", pattern: m.regex, engine: "pcre2", case_sensitive: true, source: "raw", ...(every ? { all: true } : {}) };
     return { id: `col-${name}`, description: name, selector: {}, priority: 0, fields: { [name]: { from: [g], type: spec.type, ...(spec.datetime ? { datetime: spec.datetime } : {}) } }, extract };
   }
   const exampleOf = (name, id = `col-${name}`) => { for (let i = 0; i < C.recs.length; i++) { const v = cellOf(id, name, i)?.original; if (v != null && v !== "") return v; } return ""; };
@@ -241,7 +242,7 @@ window.ExtractionColumns = (() => {
     const cands = E.candidates(rec.text, s, e, { records: C.recs.map((r) => (r.text.length > 8000 ? r.text.slice(0, 8000) : r.text)), existing: existingCtx() });
     if (!cands.length) return say("Não foi possível propor padrões para este trecho");
     const sg = ECS_NAMES(cands[0]);
-    C.draft = { s, e, rec: C.idx, cands, pick: 0, name: uniqName(sg[0] || "campo"), typeId: cands[0].typeId, typed: null, nameTouched: false, typeTouched: false, all: false, native: "pending", editing: null };
+    C.draft = { s, e, rec: C.idx, cands, pick: 0, name: uniqName(sg[0] || "campo"), typeId: cands[0].typeId, typed: null, nameTouched: false, typeTouched: false, all: false, every: false, native: "pending", editing: null };
     paint(); void verifyNative();
   }
   /** Os padrões nascem aqui (JavaScript, rápido); só ficam os que o motor nativo confirma. */
@@ -249,7 +250,7 @@ window.ExtractionColumns = (() => {
     const d = C.draft, g = gen;
     if (!d) return;
     try {
-      const r = await core.call({ action: "map_verify", texts: C.recs.map((x) => x.text), patterns: d.cands.map((c) => c.re) }, { latest: "map-columns-verify" });
+      const r = await core.call({ action: "map_verify", texts: C.recs.map((x) => x.text), patterns: d.cands.map((c) => c.re), counts: true }, { latest: "map-columns-verify" });
       if (!alive(g) || C.draft !== d) return;
       const kept = [];
       d.cands.forEach((c, i) => {
@@ -259,6 +260,7 @@ window.ExtractionColumns = (() => {
         if (!at || !(c.part ? at[0] >= d.s && at[1] <= d.e : at[0] === d.s && at[1] === d.e)) return;
         c.values = res.ranges.map((x, k) => (x ? C.recs[k].text.slice(x[0], x[1]) : null));
         c.cover = c.values.filter((v) => v != null).length;
+        c.counts = res.counts || null;
         c.confirmed = true;
         kept.push(c);
       });
@@ -267,17 +269,18 @@ window.ExtractionColumns = (() => {
     } catch (e) { if (alive(g) && C.draft === d && !window.LocalNative.superseded(e)) d.native = "unconfirmed"; }
     if (alive(g) && C.draft === d) { paint(); void evaluate(); }
   }
-  const effMode = () => { const d = C.draft; const c = d && d.typed == null ? d.cands[d.pick] : null; return c && c.forms(gname(d.name || "campo")).grok == null ? "regex" : C.mode; };
+  const effMode = () => { const d = C.draft; if (d?.every) return "regex"; const c = d && d.typed == null ? d.cands[d.pick] : null; return c && c.forms(gname(d.name || "campo")).grok == null ? "regex" : C.mode; };
   const exprOf = (c, name, mode) => { const f = c.forms(gname(name)); return mode === "grok" && f.grok != null ? f.grok : f.regex; };
   /** O que será gravado para o rascunho atual. */
   function draftMeta() {
     const d = C.draft;
     if (!d) return null;
+    const every = d.every ? { every: true } : {};
     if (d.typed != null) {
-      return C.mode === "grok" ? { typeId: d.typeId, mode: "grok", grok: d.typed, regex: null, custom: {} } : { typeId: d.typeId, mode: "regex", grok: null, regex: d.typed, custom: {} };
+      return C.mode === "grok" ? { typeId: d.typeId, mode: "grok", grok: d.typed, regex: null, custom: {} } : { typeId: d.typeId, mode: "regex", grok: null, regex: d.typed, custom: {}, ...every };
     }
     const c = d.cands[d.pick], f = c.forms(gname(d.name || "campo"));
-    return { typeId: d.typeId, mode: f.grok != null && C.mode === "grok" ? "grok" : "regex", grok: f.grok, regex: f.regex, custom: f.custom ? { [f.custom.name]: f.custom.src } : {} };
+    return { typeId: d.typeId, mode: f.grok != null && C.mode === "grok" && !d.every ? "grok" : "regex", grok: f.grok, regex: f.regex, custom: f.custom ? { [f.custom.name]: f.custom.src } : {}, ...every };
   }
   function pick(i) {
     const d = C.draft;
@@ -372,6 +375,13 @@ window.ExtractionColumns = (() => {
     code.dataset.custom = String(!!f?.pattern);
   }
   const covClass = (c) => (c.cover === c.total ? "" : c.cover === 0 ? "low" : "mid");
+  /** "Todas as ocorrências" aparece quando o padrão encontra mais de um valor no registro (ou já estava ligado). */
+  function everyBlock(d) {
+    const c = d.typed == null ? d.cands[d.pick] : null, n = c?.counts?.[d.rec] ?? 0;
+    if (!(d.every || n > 1 || (d.typed != null && C.mode === "regex" && d.editing))) return "";
+    const blocked = d.typed != null && C.mode === "grok";
+    return `<label class="cx-every"><input type="checkbox" id="cx-every" ${d.every ? "checked" : ""} ${blocked ? "disabled" : ""}><span><b>Todas as ocorrências no registro</b>${n > 1 ? ` <em>aparece ${n} vezes neste</em>` : ""}<small>${blocked ? "Disponível só em Regex." : "Os valores ficam juntos na coluna, separados por vírgula (como texto). Útil em listas: portas, endereços, nomes repetidos."}</small></span></label>`;
+  }
   function paintNew() {
     const d = C.draft, box = q("#cx-new");
     box.className = "cx-card" + (d ? " draft" : "");
@@ -385,11 +395,18 @@ window.ExtractionColumns = (() => {
     <div class="cx-head"><div class="cx-sec">Padrões possíveis <span class="cx-sub">· ${d.cands.length} verificados (de ${d.cands.total || d.cands.length} testados)${d.native === "pending" ? " · confirmando…" : d.native === "unconfirmed" ? " · não confirmados pelo motor" : ""}</span> <button class="cx-i" data-info="padroes" type="button" aria-label="Mais informações">${svg("info")}</button></div></div>
     <div class="cx-opts" role="radiogroup" aria-label="Padrões possíveis">${shown.map(({ p, i }) => `<button class="cx-opt" role="radio" aria-checked="${d.typed == null && i === d.pick}" data-p="${i}"><span class="cx-rd"></span><span><b>${h(p.label)}</b>${p.rec ? '<span class="cx-rec">recomendado</span>' : ""}<span class="cx-why">${h(p.why || "")}</span><span class="cx-badges">${p.once && p.cover === p.total ? '<span class="cx-bd ok">estável</span>' : p.once ? "" : '<span class="cx-bd warn">acha mais de um em alguma amostra</span>'}${p.homog ? '<span class="cx-bd">formato parecido nas amostras</span>' : ""}${p.alts ? `<span class="cx-bd">+${p.alts} equivalentes</span>` : ""}</span><code>${h(exprOf(p, d.name || "campo", C.mode))}</code><span class="cx-exv">${h(p.values.filter((v) => v != null).slice(0, 3).join("  ·  "))}</span></span><span class="cx-cov ${covClass(p)}">${p.cover}/${p.total}</span></button>`).join("")}</div>
     ${d.cands.length > 8 ? `<button class="cx-btn small" id="cx-more" type="button" style="margin-bottom:10px">${d.all ? "Mostrar só as melhores" : `Ver todas as ${d.cands.length} possibilidades verificadas`}</button>` : ""}
+    ${everyBlock(d)}
     <div class="cx-head"><div class="cx-sec">Expressão</div><div class="cx-seg" role="group" aria-label="Tipo de expressão"><button id="cx-m-grok" aria-pressed="${mode === "grok"}" ${effMode() === "regex" && C.mode === "grok" && d.typed == null ? 'title="Este padrão só existe em Regex"' : ""}>Grok</button><button id="cx-m-regex" aria-pressed="${mode === "regex"}">Regex</button></div></div>
     <textarea class="cx-expr" id="cx-expr" spellcheck="false" aria-label="Expressão">${h(d.typed != null ? d.typed : exprOf(d.cands[d.pick], d.name || "campo", mode))}</textarea>
     <div class="cx-status" id="cx-status"></div>`;
     box.querySelector("#cx-d-ok").onclick = commitDraft; box.querySelector("#cx-d-cancel").onclick = () => { C.draft = null; paint(); void evaluate(); };
     const more = box.querySelector("#cx-more"); if (more) more.onclick = () => { d.all = !d.all; paintNew(); };
+    const every = box.querySelector("#cx-every");
+    if (every) every.onchange = () => {
+      d.every = every.checked;
+      if (!d.typeTouched) d.typeId = d.every ? "texto" : (d.cands[d.pick]?.typeId || d.typeId);
+      paintNew(); paintRows(); later("eval", () => void evaluate(), 80);
+    };
     const nameInput = box.querySelector("#cx-nameinput");
     nameInput.oninput = (e) => {
       const old = gname(d.name || "campo");
@@ -428,11 +445,11 @@ window.ExtractionColumns = (() => {
     const body = q("#cx-rows"), d = C.draft;
     if (!body) return;
     const rows = [], join = (vs) => h(vs.filter((x) => x != null && x !== "").slice(0, 3).join("  ·  "));
-    if (d) rows.push(`<tr class="draftrow"><td><span class="dot" style="--c:var(--cx-accent)"></span>${h(d.name || "(sem nome)")}<span class="tag new">${d.editing ? "editando" : "novo"}</span></td><td>${h(E.T(d.typeId).l)}</td><td class="cx-ex">${join(valuesOfDraft())}</td></tr>`);
+    if (d) rows.push(`<tr class="draftrow"><td><span class="dot" style="--c:var(--cx-accent)"></span>${h(d.name || "(sem nome)")}<span class="tag new">${d.editing ? "editando" : "novo"}</span></td><td>${h(E.T(d.typeId).l)}${d.every ? '<span class="tag">lista</span>' : ""}</td><td class="cx-ex">${join(valuesOfDraft())}</td></tr>`);
     for (const r of columns()) {
       if (d?.editing === r.description) continue;
       const m = metaAll()[r.description], vs = valuesOfColumn(r.description), bad = C.res?.results?.some((x, i) => cellOf(r.id, r.description, i)?.status === "invalid");
-      rows.push(`<tr data-c="${h(r.description)}"><td class="nm" data-nm="${h(r.description)}"><span class="dot" style="--c:${color(r.description)}"></span>${h(r.description)}</td><td class="ty" data-ty="${h(r.description)}">${h(E.T(m.typeId).l)}${bad ? '<span class="tag warn" title="Alguns valores não cabem neste tipo">valores inválidos</span>' : ""}</td><td class="cx-ex">${join(vs)}</td></tr>`);
+      rows.push(`<tr data-c="${h(r.description)}"><td class="nm" data-nm="${h(r.description)}"><span class="dot" style="--c:${color(r.description)}"></span>${h(r.description)}</td><td class="ty" data-ty="${h(r.description)}">${h(E.T(m.typeId).l)}${m.every ? '<span class="tag">lista</span>' : ""}${bad ? '<span class="tag warn" title="Alguns valores não cabem neste tipo">valores inválidos</span>' : ""}</td><td class="cx-ex">${join(vs)}</td></tr>`);
     }
     for (const c of detectedCols()) rows.push(`<tr data-ex="1"><td><span class="dot" style="--c:var(--cx-muted)"></span>${h(c.name)}<span class="tag">já existe</span></td><td>${h(E.T(inferType(c.values)).l)}</td><td class="cx-ex">${join(c.values)}</td></tr>`);
     body.innerHTML = rows.join("") || `<tr><td colspan="3" class="cx-empty-row">Nenhuma coluna ainda.</td></tr>`;
@@ -493,7 +510,7 @@ window.ExtractionColumns = (() => {
   function editColumn(name) {
     const m = metaAll()[name];
     C.mode = m.mode === "grok" && m.grok != null ? "grok" : "regex";
-    C.draft = { s: 0, e: 0, rec: C.idx, cands: [{ label: "Padrão atual", why: "O padrão gravado", re: "", values: valuesOfColumn(name), cover: valuesOfColumn(name).filter((v) => v != null).length, total: C.recs.length, once: true, homog: true, typeId: m.typeId, names: [name], forms: () => ({ grok: m.grok, regex: m.regex, custom: null }) }], pick: 0, name, typeId: m.typeId, typed: C.mode === "grok" ? m.grok : m.regex, nameTouched: true, typeTouched: true, all: false, native: "ok", editing: name };
+    C.draft = { s: 0, e: 0, rec: C.idx, cands: [{ label: "Padrão atual", why: "O padrão gravado", re: "", values: valuesOfColumn(name), cover: valuesOfColumn(name).filter((v) => v != null).length, total: C.recs.length, once: true, homog: true, typeId: m.typeId, names: [name], forms: () => ({ grok: m.grok, regex: m.regex, custom: null }) }], pick: 0, name, typeId: m.typeId, typed: C.mode === "grok" ? m.grok : m.regex, nameTouched: true, typeTouched: true, all: false, every: !!m.every, native: "ok", editing: name };
     C.draft.cands.total = 1;
     paint(); void evaluate();
   }

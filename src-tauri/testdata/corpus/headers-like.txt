@@ -1,0 +1,6 @@
+Host: example.test
+User-Agent: curl/8.4.0
+Accept: */*
+X-Request-Id: abc-123
+Caused by: java.io.IOException: broken pipe
+Note: this is an ordinary sentence with a colon

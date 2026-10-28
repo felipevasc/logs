@@ -103,6 +103,10 @@ exata. **Exportar tudo** percorre o snapshot inteiro no processo nativo, com
 publicação atômica no destino. JSONL inclui valores textuais e seus tipos; SQL NULL
 permanece null. CSV usa campos entre aspas e representação textual das células.
 Resultados com `id` e `event_ref` podem abrir a origem, após verificação nativa.
+Listas viram linhas com `unnest`: `SELECT id, unnest(string_split("nmap.ports_open", ',')) FROM events`
+dá uma linha por porta, e `unnest(json_extract("nmap.ports", '$[*]'))` dá um objeto por porta, que
+`json_extract_string(p, '$.service')` lê (veja os exemplos “Lista em linhas” e “Uma linha por porta”).
+`unnest` só vale na lista de seleção; funções de tabela continuam recusadas.
 As funções SQL `regexp_*` seguem os recursos do DuckDB. Para usar PCRE2 em uma
 consulta, aplique a expressão em **Eventos** (com “Aplicar filtros atuais” ativo
 no SQL) ou extraia um campo por captura e consulte esse campo.

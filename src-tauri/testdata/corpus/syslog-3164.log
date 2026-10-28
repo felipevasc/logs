@@ -1,0 +1,5 @@
+Oct 12 00:00:01 srv01 sshd[1234]: Failed password for invalid user admin from 203.0.113.5 port 4040 ssh2
+Oct 12 00:00:02 srv01 sshd[1234]: Accepted publickey for ana from 198.51.100.7 port 4041 ssh2
+Oct 12 00:00:03 srv01 sudo:      ana : TTY=pts/0 ; PWD=/home/ana ; USER=root ; COMMAND=/bin/ls
+Oct 12 00:00:04 srv01 kernel: [ 1234.567890] eth0: link up
+Oct 12 00:00:05 srv01 CRON[999]: (root) CMD (/usr/lib/x/run)

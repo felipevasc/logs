@@ -1,0 +1,5 @@
+#separator \x09
+#fields	ts	uid	id.orig_h	id.orig_p	id.resp_h	id.resp_p	proto	service
+#types	time	string	addr	port	addr	port	enum	string
+1760227201.123456	Cabc	10.0.0.5	51000	198.51.100.7	443	tcp	ssl
+1760227202.223456	Cdef	10.0.0.6	51001	203.0.113.5	80	tcp	http

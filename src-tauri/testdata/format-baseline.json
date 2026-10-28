@@ -1,0 +1,611 @@
+{
+  "apache-combined.log": {
+    "format": "apache",
+    "records": 5,
+    "stamped": 5,
+    "digest": "fcb7e765f9238c3c",
+    "fields": {
+      "agent": 5,
+      "client_ip": 5,
+      "method": 5,
+      "parser.format": 5,
+      "path": 5,
+      "path.id": 1,
+      "protocol": 5,
+      "referer": 5,
+      "remote_addr": 5,
+      "request": 5,
+      "request.id": 1,
+      "request_id": 1,
+      "size": 5,
+      "status": 5,
+      "time_local": 5,
+      "ua.class": 5,
+      "ua.family": 5,
+      "ua.os": 2,
+      "ua.version": 5,
+      "user": 1
+    }
+  },
+  "apache-error.log": {
+    "format": "apache-error",
+    "records": 3,
+    "stamped": 3,
+    "digest": "4c222d6dab184f14",
+    "fields": {
+      "client_ip": 2,
+      "client_port": 2,
+      "module": 3,
+      "parser.format": 3,
+      "pid": 3,
+      "tid": 1
+    }
+  },
+  "auditd.log": {
+    "format": "auditd",
+    "records": 3,
+    "stamped": 3,
+    "digest": "b1f2f024b660af24",
+    "fields": {
+      "a0": 1,
+      "a1": 1,
+      "arch": 1,
+      "argc": 1,
+      "audit_serial": 3,
+      "auid": 1,
+      "comm": 1,
+      "exe": 1,
+      "exit": 1,
+      "pid": 2,
+      "res": 1,
+      "success": 1,
+      "syscall": 1,
+      "type": 3,
+      "uid": 2
+    }
+  },
+  "cef.log": {
+    "format": "cef",
+    "records": 2,
+    "stamped": 2,
+    "digest": "0fd93970216ef136",
+    "fields": {
+      "client_ip": 2,
+      "dpt": 1,
+      "dst": 2,
+      "host": 1,
+      "product_version": 2,
+      "spt": 1,
+      "src": 2,
+      "vendor": 2
+    }
+  },
+  "dhcp-preamble.log": {
+    "format": "csv",
+    "records": 7,
+    "stamped": 4,
+    "digest": "8d591cb2b08e08e6",
+    "fields": {
+      "IP Address": 4,
+      "MAC Address": 4,
+      "parser.format": 1,
+      "pid": 1
+    }
+  },
+  "dotted-dates.log": {
+    "format": "mixed",
+    "records": 4,
+    "stamped": 4,
+    "digest": "325e4d2b9afdf774",
+    "fields": {
+      "parser.format": 4
+    }
+  },
+  "ecs.jsonl": {
+    "format": "jsonl",
+    "records": 3,
+    "stamped": 3,
+    "digest": "3fdb2b9e9c41af61",
+    "fields": {
+      "event.duration": 1,
+      "host": 2,
+      "host.name": 2,
+      "log.level": 3,
+      "service": 1,
+      "service.name": 1,
+      "user.name": 1
+    }
+  },
+  "exemplo-apache.log": {
+    "format": "apache",
+    "records": 8,
+    "stamped": 8,
+    "digest": "3ebcd17687f29d96",
+    "fields": {
+      "agent": 8,
+      "client_ip": 8,
+      "method": 8,
+      "parser.format": 8,
+      "path": 8,
+      "protocol": 8,
+      "referer": 8,
+      "remote_addr": 8,
+      "request": 8,
+      "size": 8,
+      "status": 8,
+      "time_local": 8,
+      "ua.anomaly": 4,
+      "ua.anomaly_detail": 4,
+      "ua.class": 8,
+      "ua.family": 8,
+      "ua.version": 4,
+      "user": 1
+    }
+  },
+  "exemplo-cef.log": {
+    "format": "cef",
+    "records": 6,
+    "stamped": 0,
+    "digest": "3568bb857ca3b859",
+    "fields": {
+      "act": 4,
+      "client_ip": 6,
+      "dpt": 4,
+      "dst": 5,
+      "fname": 1,
+      "product_version": 6,
+      "proto": 1,
+      "spt": 3,
+      "src": 6,
+      "suser": 1,
+      "vendor": 6
+    }
+  },
+  "exemplo-firewall.log": {
+    "format": "firewall",
+    "records": 6,
+    "stamped": 6,
+    "digest": "36abb13e72b88c0d",
+    "fields": {
+      "DPT": 6,
+      "DST": 6,
+      "IN": 6,
+      "MAC": 1,
+      "OUT": 6,
+      "PROTO": 6,
+      "SPT": 6,
+      "SRC": 6,
+      "client_ip": 6,
+      "dpt": 6,
+      "dst": 6,
+      "iface_in": 6,
+      "iface_out": 6,
+      "process": 6,
+      "proto": 6,
+      "spt": 6,
+      "src": 6
+    }
+  },
+  "exemplo-java.log": {
+    "format": "log4j",
+    "records": 9,
+    "stamped": 9,
+    "digest": "7299236173f7b08a",
+    "fields": {
+      "exception": 3,
+      "java.exception.class": 3,
+      "java.exception.message": 3,
+      "java.trace.complete": 3,
+      "logger": 9,
+      "stacktrace": 3,
+      "thread": 9
+    }
+  },
+  "exemplo-syslog.log": {
+    "format": "syslog3164",
+    "records": 8,
+    "stamped": 8,
+    "digest": "8eb36ecb31ff5549",
+    "fields": {
+      "pid": 7,
+      "process": 8
+    }
+  },
+  "exemplo.jsonl": {
+    "format": "jsonl",
+    "records": 12,
+    "stamped": 12,
+    "digest": "4b573301d2be36ca",
+    "fields": {
+      "cliente": 5,
+      "duracao_ms": 1,
+      "gateway": 3,
+      "latencia_ms": 3,
+      "motivo": 1,
+      "tentativas": 1,
+      "valor": 5,
+      "version": 1
+    }
+  },
+  "exemplo.log": {
+    "format": "mixed",
+    "records": 12,
+    "stamped": 12,
+    "digest": "892606023b0c0054",
+    "fields": {
+      "method": 1,
+      "parser.format": 12,
+      "path": 1,
+      "request": 1
+    }
+  },
+  "headers-like.txt": {
+    "format": "mixed",
+    "records": 6,
+    "stamped": 0,
+    "digest": "5ce8ec2116545597",
+    "fields": {
+      "component": 4,
+      "parser.format": 5
+    }
+  },
+  "ini-like.conf": {
+    "format": "mixed",
+    "records": 5,
+    "stamped": 0,
+    "digest": "62de28a1a776c962",
+    "fields": {
+      "component": 5,
+      "parser.format": 5
+    }
+  },
+  "iptables-firewall.log": {
+    "format": "firewall",
+    "records": 3,
+    "stamped": 3,
+    "digest": "4ed6a0e31e75c9ae",
+    "fields": {
+      "DPT": 3,
+      "DST": 3,
+      "IN": 3,
+      "OUT": 3,
+      "PROTO": 3,
+      "SPT": 3,
+      "SRC": 3,
+      "client_ip": 3,
+      "dpt": 3,
+      "dst": 3,
+      "iface_in": 3,
+      "iface_out": 3,
+      "process": 3,
+      "proto": 3,
+      "spt": 3,
+      "src": 3
+    }
+  },
+  "klog-kubernetes.log": {
+    "format": "mixed",
+    "records": 3,
+    "stamped": 3,
+    "digest": "6758a8714d2f93c0",
+    "fields": {
+      "caller": 3,
+      "parser.format": 3,
+      "pid": 3
+    }
+  },
+  "labeled-spaces.log": {
+    "format": "labeled",
+    "records": 4,
+    "stamped": 0,
+    "digest": "7203e80cf7f345ce",
+    "fields": {
+      "component": 4,
+      "label.level": 4,
+      "label.msg": 4,
+      "label.status": 4,
+      "parser.format": 4
+    }
+  },
+  "labeled-tab.log": {
+    "format": "labeled",
+    "records": 5,
+    "stamped": 4,
+    "digest": "a4866ea9c20b251c",
+    "fields": {
+      "comentario": 1,
+      "component": 4,
+      "label.action": 4,
+      "label.source": 4,
+      "label.time": 4,
+      "label.user": 4,
+      "parser.format": 4
+    }
+  },
+  "leef.log": {
+    "format": "leef",
+    "records": 2,
+    "stamped": 1,
+    "digest": "b010501a0b33ed74",
+    "fields": {
+      "cat": 1,
+      "client_ip": 2,
+      "dst": 2,
+      "product_version": 2,
+      "src": 2,
+      "vendor": 2
+    }
+  },
+  "log4j-multiline.log": {
+    "format": "log4j",
+    "records": 3,
+    "stamped": 3,
+    "digest": "93cd882d43298f40",
+    "fields": {
+      "exception": 1,
+      "java.exception.class": 1,
+      "java.exception.message": 1,
+      "java.root_cause.class": 1,
+      "java.trace.complete": 1,
+      "java.trace.fingerprint": 1,
+      "logger": 3,
+      "stacktrace": 1,
+      "thread": 3
+    }
+  },
+  "logfmt.log": {
+    "format": "logfmt",
+    "records": 4,
+    "stamped": 4,
+    "digest": "74360fad4e7755f6",
+    "fields": {
+      "component": 1,
+      "dur": 3,
+      "err": 1,
+      "level": 4,
+      "method": 2,
+      "msg": 4,
+      "path": 2,
+      "status": 2,
+      "table": 1,
+      "ts": 4
+    }
+  },
+  "mixed-formats.log": {
+    "format": "mixed",
+    "records": 5,
+    "stamped": 4,
+    "digest": "fdee620e34e13c10",
+    "fields": {
+      "level": 1,
+      "msg": 1,
+      "parser.format": 1,
+      "pid": 1,
+      "process": 1,
+      "ts": 1
+    }
+  },
+  "nginx-error.log": {
+    "format": "nginx-error",
+    "records": 4,
+    "stamped": 4,
+    "digest": "287cb99358a1fb90",
+    "fields": {
+      "client": 3,
+      "client_ip": 3,
+      "connection": 3,
+      "host": 1,
+      "method": 1,
+      "parser.format": 4,
+      "path": 1,
+      "pid": 4,
+      "protocol": 1,
+      "request": 1,
+      "server": 3,
+      "tid": 4
+    }
+  },
+  "nmap-grepable.gnmap": {
+    "format": "labeled",
+    "records": 25,
+    "stamped": 0,
+    "digest": "e611e5180b58660a",
+    "fields": {
+      "comentario": 1,
+      "component": 24,
+      "destination.ip": 24,
+      "host": 11,
+      "host.name": 11,
+      "label.host": 24,
+      "label.ignored_state": 1,
+      "label.os": 1,
+      "label.ports": 23,
+      "label.status": 1,
+      "nmap.closed_count": 23,
+      "nmap.command": 1,
+      "nmap.filtered_count": 23,
+      "nmap.ignored_state": 1,
+      "nmap.open": 23,
+      "nmap.open_count": 23,
+      "nmap.os": 1,
+      "nmap.ports": 23,
+      "nmap.ports_open": 23,
+      "nmap.ports_total": 23,
+      "nmap.services": 23,
+      "nmap.status": 1,
+      "parser.format": 24
+    }
+  },
+  "plain-text.log": {
+    "format": "mixed",
+    "records": 4,
+    "stamped": 0,
+    "digest": "bad600c97f834403",
+    "fields": {}
+  },
+  "python-logging.log": {
+    "format": "mixed",
+    "records": 3,
+    "stamped": 3,
+    "digest": "a572849e0aeadf91",
+    "fields": {
+      "exception": 1,
+      "logger": 3,
+      "parser.format": 3
+    }
+  },
+  "records-envelope.json": {
+    "format": "jsonl",
+    "records": 2,
+    "stamped": 2,
+    "digest": "aaf0454e6b057919",
+    "fields": {
+      "awsRegion": 2,
+      "eventName": 2,
+      "eventSource": 2,
+      "eventTime": 2,
+      "sourceIPAddress": 2,
+      "userIdentity.type": 2,
+      "userIdentity.userName": 2
+    }
+  },
+  "syslog-3164.log": {
+    "format": "syslog3164",
+    "records": 5,
+    "stamped": 5,
+    "digest": "fc68190ff2ab2649",
+    "fields": {
+      "COMMAND": 1,
+      "PWD": 1,
+      "TTY": 1,
+      "USER": 1,
+      "pid": 3,
+      "process": 5
+    }
+  },
+  "syslog-5424.log": {
+    "format": "syslog5424",
+    "records": 3,
+    "stamped": 3,
+    "digest": "c139c7f434d7aa80",
+    "fields": {
+      "action": 1,
+      "app": 3,
+      "msgid": 3,
+      "pid": 3,
+      "result": 1,
+      "sd.exampleSDID@32473.eventSource": 1,
+      "sd.exampleSDID@32473.iut": 1,
+      "service": 3,
+      "syslog.facility": 3,
+      "syslog.severity": 3,
+      "user": 1
+    }
+  },
+  "tab-text-not-labeled.txt": {
+    "format": "tsv",
+    "records": 3,
+    "stamped": 0,
+    "digest": "363afd0fec9702e0",
+    "fields": {
+      "name": 3,
+      "value": 3
+    }
+  },
+  "table-semicolon.csv": {
+    "format": "csv-semicolon",
+    "records": 4,
+    "stamped": 4,
+    "digest": "97ee6f57bde89a89",
+    "fields": {
+      "acao": 4,
+      "usuario": 4,
+      "valor": 4
+    }
+  },
+  "table.csv": {
+    "format": "csv",
+    "records": 4,
+    "stamped": 4,
+    "digest": "fb233cfa07121b7c",
+    "fields": {
+      "action": 4,
+      "bytes": 4,
+      "src_ip": 4,
+      "user": 4
+    }
+  },
+  "table.tsv": {
+    "format": "tsv",
+    "records": 3,
+    "stamped": 3,
+    "digest": "3feff0fe339fa503",
+    "fields": {}
+  },
+  "version-strings.log": {
+    "format": "mixed",
+    "records": 4,
+    "stamped": 1,
+    "digest": "c8d2dbf6b895127f",
+    "fields": {
+      "parser.format": 1
+    }
+  },
+  "w3c-iis.log": {
+    "format": "w3c",
+    "records": 3,
+    "stamped": 3,
+    "digest": "c960f295489b9be5",
+    "fields": {
+      "c-ip": 3,
+      "client_ip": 3,
+      "cs(user-agent)": 3,
+      "cs-method": 3,
+      "cs-uri-stem": 3,
+      "cs-username": 1,
+      "s-port": 3,
+      "sc-bytes": 3,
+      "time-taken": 3,
+      "ua.class": 3,
+      "ua.family": 3,
+      "ua.os": 2,
+      "ua.version": 1
+    }
+  },
+  "wildfly-server.log": {
+    "format": "wildfly",
+    "records": 3,
+    "stamped": 3,
+    "digest": "bae23a6c8ec479ff",
+    "fields": {
+      "logger": 3,
+      "thread": 3
+    }
+  },
+  "windows-event.xml": {
+    "format": "xml",
+    "records": 2,
+    "stamped": 2,
+    "digest": "a6fd9e2692c42c7d",
+    "fields": {
+      "TargetUserName": 2,
+      "computer": 2,
+      "host": 2,
+      "parser.format": 2
+    }
+  },
+  "zeek-conn.log": {
+    "format": "zeek",
+    "records": 2,
+    "stamped": 2,
+    "digest": "c841d822c42cf85f",
+    "fields": {
+      "id.orig_h": 2,
+      "id.orig_p": 2,
+      "id.resp_h": 2,
+      "id.resp_p": 2,
+      "proto": 2,
+      "uid": 2
+    }
+  }
+}

@@ -1,0 +1,4 @@
+ts=2026-10-12T00:00:01Z level=info msg="request done" method=GET path=/api/items status=200 dur=12ms
+ts=2026-10-12T00:00:02Z level=error msg="db timeout" component=store err="context deadline exceeded"
+ts=2026-10-12T00:00:03Z level=warn msg="slow query" dur=1500ms table=orders
+ts=2026-10-12T00:00:04Z level=info msg="request done" method=POST path=/api/items status=201 dur=40ms

@@ -1,0 +1,4 @@
+Started service foo version 2.4.62 on port 80
+Using library libxml 2.9.14 and zlib 1.2.13 from /usr/lib
+Server banner: Apache httpd 2.2.15 ((CentOS)) PHP 5.6.38
+12/10/2026 00:00:04 build 1.4.7 finished

@@ -1,0 +1,5 @@
+timestamp,user,action,src_ip,bytes
+2026-10-12T00:00:01Z,ana,login,203.0.113.5,120
+2026-10-12T00:00:02Z,bruno,download,198.51.100.7,52000
+2026-10-12T00:00:03Z,ana,logout,203.0.113.5,0
+2026-10-12T00:00:04Z,carla,login,198.51.100.9,98

@@ -1,0 +1,4 @@
+2026/10/12 00:00:01 [error] 1234#0: *5 open() "/usr/share/nginx/html/x" failed (2: No such file or directory), client: 203.0.113.5, server: example.test, request: "GET /x HTTP/1.1", host: "example.test"
+2026/10/12 00:00:02 [warn] 1234#0: *6 upstream server temporarily disabled while connecting to upstream, client: 203.0.113.6, server: example.test
+2026/10/12 00:00:03 [error] 1234#0: *7 connect() failed (111: Connection refused) while connecting to upstream, client: 203.0.113.7, server: example.test
+2026/10/12 00:00:04 [notice] 1#0: signal process started

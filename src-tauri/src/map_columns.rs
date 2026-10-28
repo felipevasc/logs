@@ -90,7 +90,7 @@ pub(crate) fn frame(path: &str, pattern: Option<&str>, count: usize) -> Result<V
 
 /// Every candidate against every text: the range of its first capture group in the first match
 /// (UTF-16 units, like the page), or `null`. A pattern the engine rejects or abandons says so.
-pub(crate) fn verify(texts: &[String], patterns: &[String]) -> Result<Value, String> {
+pub(crate) fn verify(texts: &[String], patterns: &[String], counts: bool) -> Result<Value, String> {
     if texts.is_empty() || texts.len() > MAX_TEXTS || texts.iter().map(String::len).sum::<usize>() > MAX_TEXT_BYTES {
         return Err("Informe de 1 a 200 registros (até 2 MiB no total).".into());
     }
@@ -108,28 +108,34 @@ pub(crate) fn verify(texts: &[String], patterns: &[String]) -> Result<Value, Str
             }
         };
         let mut ranges: Vec<Value> = Vec::with_capacity(texts.len());
+        let mut occurrences: Vec<Value> = Vec::new();
         let mut failure: Option<String> = None;
         for subject in texts {
             if failure.is_some() {
                 ranges.push(Value::Null);
+                occurrences.push(json!(0));
                 continue;
             }
-            match matcher.first_ranges(subject) {
-                Ok(Some(groups)) => ranges.push(match groups.get(1).copied().flatten() {
-                    Some((a, b)) => json!([utf16(subject, a), utf16(subject, b)]),
-                    None => Value::Null,
-                }),
-                Ok(None) => ranges.push(Value::Null),
+            let found = if counts { matcher.all_ranges(subject, 50) } else { matcher.first_ranges(subject).map(|first| first.into_iter().collect()) };
+            match found {
+                Ok(all) => {
+                    ranges.push(match all.first().and_then(|groups| groups.get(1).copied().flatten()) {
+                        Some((a, b)) => json!([utf16(subject, a), utf16(subject, b)]),
+                        None => Value::Null,
+                    });
+                    occurrences.push(json!(all.iter().filter(|groups| groups.get(1).copied().flatten().is_some()).count()));
+                }
                 Err(error) => {
                     if crate::operations::check().is_err() {
                         return Err(error);
                     }
                     failure = Some(error);
                     ranges.push(Value::Null);
+                    occurrences.push(json!(0));
                 }
             }
         }
-        out.push(json!({"error": failure, "ranges": ranges}));
+        out.push(if counts { json!({"error": failure, "ranges": ranges, "counts": occurrences}) } else { json!({"error": failure, "ranges": ranges}) });
     }
     Ok(json!({"results": out}))
 }
@@ -142,11 +148,16 @@ mod tests {
     fn verify_reports_group_one_in_utf16_units() {
         let texts = vec!["ação (sku 42) fim".to_owned(), "nada".to_owned()];
         let patterns = vec![r"\((sku \d+)\)".to_owned(), r"(".to_owned(), r"(?<!\w)(\d+)(?!\w)".to_owned()];
-        let r = verify(&texts, &patterns).unwrap();
+        let r = verify(&texts, &patterns, false).unwrap();
         let results = r["results"].as_array().unwrap();
         assert_eq!(results[0]["ranges"], json!([[6, 12], null]));
         assert!(results[1]["error"].is_string());
         assert_eq!(results[2]["ranges"], json!([[10, 12], null]));
+        // with counts: how many times each pattern's group 1 occurs in a text
+        let counted = verify(&["80/open, 443/open, 22/closed".to_owned()], &[r"(\d+)/open".to_owned(), r"(\d+)/udp".to_owned()], true).unwrap();
+        assert_eq!(counted["results"][0]["counts"], json!([2]));
+        assert_eq!(counted["results"][1]["counts"], json!([0]));
+        assert_eq!(counted["results"][0]["ranges"], json!([[0, 2]]));
     }
 
     #[test]

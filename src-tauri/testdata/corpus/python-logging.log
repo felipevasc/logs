@@ -1,0 +1,7 @@
+2026-10-12 00:00:01,123 - app.main - INFO - starting
+2026-10-12 00:00:02,223 - app.db - ERROR - connection lost
+Traceback (most recent call last):
+  File "/app/db.py", line 10, in connect
+    raise RuntimeError('lost')
+RuntimeError: lost
+2026-10-12 00:00:03,323 - app.main - WARNING - retrying

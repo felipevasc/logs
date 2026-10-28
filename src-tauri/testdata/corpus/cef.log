@@ -1,0 +1,2 @@
+CEF:0|Security|threatmanager|1.0|100|worm successfully stopped|10|src=10.0.0.1 dst=2.1.2.2 spt=1232 rt=1760227201000
+Oct 12 00:00:02 fw01 CEF:0|Vendor|Prod|2.0|200|Port scan|5|src=198.51.100.7 dst=10.0.0.5 dpt=443 msg=scan detected

@@ -20,7 +20,7 @@ fn err(e: impl std::fmt::Display) -> String {
 fn ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
-const FUNCTIONS:&str="count sum avg min max first last any_value median mode quantile quantile_cont quantile_disc stddev stddev_pop stddev_samp variance var_pop var_samp approx_count_distinct string_agg list array_agg bool_and bool_or arg_min arg_max histogram count_if row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value abs ceil ceiling floor round trunc power sqrt ln log log10 exp sign greatest least coalesce if ifnull nullif nullifzero zeroifnull lower upper length char_length octet_length bit_length trim ltrim rtrim substring substr left right replace concat concat_ws starts_with ends_with contains position strpos split_part string_split str_split regexp_matches regexp_full_match regexp_extract regexp_extract_all regexp_replace regexp_split_to_array levenshtein md5 sha256 hash typeof json_valid json_extract json_extract_string json_value json_type json_array_length json_keys to_json to_timestamp epoch epoch_ms epoch_us make_timestamp date_trunc date_part date_diff datediff strftime strptime try_strptime day month year hour minute second cast try_cast count_star";
+const FUNCTIONS:&str="count sum avg min max first last any_value median mode quantile quantile_cont quantile_disc stddev stddev_pop stddev_samp variance var_pop var_samp approx_count_distinct string_agg list array_agg bool_and bool_or arg_min arg_max histogram count_if row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value abs ceil ceiling floor round trunc power sqrt ln log log10 exp sign greatest least coalesce if ifnull nullif nullifzero zeroifnull lower upper length char_length octet_length bit_length trim ltrim rtrim substring substr left right replace concat concat_ws starts_with ends_with contains position strpos split_part string_split str_split regexp_matches regexp_full_match regexp_extract regexp_extract_all regexp_replace regexp_split_to_array unnest levenshtein md5 sha256 hash typeof json_valid json_extract json_extract_string json_value json_type json_array_length json_keys to_json to_timestamp epoch epoch_ms epoch_us make_timestamp date_trunc date_part date_diff datediff strftime strptime try_strptime day month year hour minute second cast try_cast count_star";
 struct Guard {
     ctes: HashSet<String>,
     forbidden: HashSet<String>,
@@ -478,6 +478,36 @@ mod tests {
     fn accepts_ctes_aggregates_windows_and_quoted_fields() {
         assert!(check("WITH counts AS (SELECT level, count(*) AS n FROM events GROUP BY level) SELECT *, rank() OVER (ORDER BY n DESC) FROM counts").is_ok());
         assert!(check("SELECT try_cast(\"process.pid\" AS BIGINT), event_ref FROM events").is_ok());
+    }
+    #[test]
+    fn one_row_per_list_item_with_unnest_but_no_table_functions() {
+        assert!(check("SELECT \"destination.ip\", unnest(string_split(\"nmap.ports_open\", ',')) AS porta FROM events").is_ok());
+        assert!(check("SELECT id, unnest(regexp_extract_all(raw, '([0-9]+)/open', 1)) FROM events").is_ok());
+        assert!(check("SELECT * FROM unnest([1,2,3])").is_err());
+        assert!(check("SELECT * FROM events, unnest(string_split(raw, ',')) AS t(x)").is_err());
+    }
+    /// The "one row per list item" examples of the SQL page run on the real engine.
+    #[test]
+    fn list_examples_expand_to_one_row_per_item() {
+        let list = "WITH itens AS (SELECT id, unnest(string_split(\"nmap.ports_open\", ',')) AS item FROM events WHERE \"nmap.ports_open\" IS NOT NULL)
+SELECT id, item FROM itens ORDER BY id, item";
+        let ports = "WITH portas AS (
+  SELECT \"destination.ip\" AS ip, unnest(json_extract(\"nmap.ports\", '$[*]')) AS p
+  FROM events WHERE \"nmap.ports\" IS NOT NULL
+)
+SELECT ip, try_cast(json_extract_string(p, '$.port') AS INTEGER) AS porta, json_extract_string(p, '$.state') AS estado, json_extract_string(p, '$.service') AS servico
+FROM portas WHERE json_extract_string(p, '$.state') = 'open' ORDER BY ip, porta";
+        for sql in [list, ports] {
+            assert!(check(sql).is_ok(), "{sql}");
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE events(id BIGINT, \"destination.ip\" VARCHAR, \"nmap.ports_open\" VARCHAR, \"nmap.ports\" VARCHAR); INSERT INTO events VALUES (1, '10.0.0.1', '80,443', '[{\"port\":80,\"state\":\"open\",\"service\":\"http\"},{\"port\":443,\"state\":\"open\",\"service\":\"ssl/http\"},{\"port\":8080,\"state\":\"filtered\"}]'), (2, '10.0.0.2', NULL, NULL);").unwrap();
+        let rows = |sql: &str, columns: usize| -> Vec<Vec<Option<String>>> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.query_map([], |row| (0..columns).map(|i| row.get::<_, Option<String>>(i).or_else(|_| row.get::<_, Option<i64>>(i).map(|n| n.map(|n| n.to_string())))).collect()).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(rows(list, 2), vec![vec![Some("1".into()), Some("443".into())], vec![Some("1".into()), Some("80".into())]]);
+        assert_eq!(rows(ports, 4), vec![vec![Some("10.0.0.1".into()), Some("80".into()), Some("open".into()), Some("http".into())], vec![Some("10.0.0.1".into()), Some("443".into()), Some("open".into()), Some("ssl/http".into())]]);
     }
     #[test]
     fn rejects_external_access_including_nested_and_cte_shadowing() {

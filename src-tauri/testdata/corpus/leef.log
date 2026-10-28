@@ -1,0 +1,2 @@
+LEEF:1.0|Microsoft|MSExchange|2013 SP1|15345|src=192.0.2.0	dst=172.50.123.1	sev=5	cat=anomaly	devTime=Oct 12 2026 00:00:01
+LEEF:2.0|Vendor|Prod|1.0|42|^|src=10.0.0.1^dst=10.0.0.2^sev=2

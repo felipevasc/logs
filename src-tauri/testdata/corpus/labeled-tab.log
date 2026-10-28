@@ -1,0 +1,5 @@
+# exported by the inventory tool
+Time: 2026-10-12 00:00:01	User: ana	Action: login	Source: 203.0.113.5
+Time: 2026-10-12 00:00:02	User: bruno	Action: download	Source: 198.51.100.7
+Time: 2026-10-12 00:00:03	User: ana	Action: logout	Source: 203.0.113.5
+Time: 2026-10-12 00:00:04	User: carla	Action: login	Source: 198.51.100.9

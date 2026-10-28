@@ -1,0 +1,5 @@
+data;usuario;acao;valor
+12/10/2026 00:00:01;ana;entrou;10,5
+12/10/2026 00:00:02;bruno;saiu;0
+12/10/2026 00:00:03;carla;entrou;7,25
+13/10/2026 08:30:00;ana;saiu;1

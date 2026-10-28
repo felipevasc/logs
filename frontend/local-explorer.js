@@ -188,6 +188,14 @@ window.LocalExplorer = (() => {
       'SELECT id, event_ref, "norm.process.image",\n       try_cast("norm.process.pid" AS BIGINT) AS pid,\n       "norm.process.user"\nFROM events WHERE "norm.event.kind" = \'process_start\'',
     ],
     [
+      "Lista em linhas",
+      '-- Um valor por linha de um campo que guarda uma lista separada por vírgula\n-- (por exemplo, uma coluna criada com "Todas as ocorrências")\nSELECT id, unnest(string_split("nmap.ports_open", \',\')) AS item\nFROM events WHERE "nmap.ports_open" IS NOT NULL',
+    ],
+    [
+      "Uma linha por porta (nmap)",
+      'WITH portas AS (\n  SELECT "destination.ip" AS ip, unnest(json_extract("nmap.ports", \'$[*]\')) AS p\n  FROM events WHERE "nmap.ports" IS NOT NULL\n)\nSELECT ip,\n       try_cast(json_extract_string(p, \'$.port\') AS INTEGER) AS porta,\n       json_extract_string(p, \'$.state\') AS estado,\n       json_extract_string(p, \'$.service\') AS servico,\n       json_extract_string(p, \'$.version\') AS versao\nFROM portas\nWHERE json_extract_string(p, \'$.state\') = \'open\'\nORDER BY ip, porta',
+    ],
+    [
       "Janelas de tempo",
       "SELECT date_trunc('minute', epoch_ms(timestamp)) AS minute, count(*) AS total\nFROM events WHERE timestamp IS NOT NULL\nGROUP BY minute ORDER BY minute",
     ],

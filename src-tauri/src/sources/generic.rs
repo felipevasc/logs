@@ -1198,7 +1198,13 @@ fn split_block(text: &str) -> (&str, &str) {
 
 /// Structure of any record (a line or a multi-line block).
 pub(super) fn parse(text: &str, ctx: &Context) -> Event {
-    parse_depth(text, ctx, 0)
+    let mut ev = parse_depth(text, ctx, 0);
+    // Header and comment lines (`# Nmap 7.94 scan initiated…`, `#Comando que gerou: …`) stay records,
+    // so line numbers and offsets do not move, but they say what they are and can be filtered out.
+    if text.trim_start().starts_with('#') {
+        ev.fields.entry("comentario").or_insert(Value::Bool(true));
+    }
+    ev
 }
 
 fn parse_depth(text: &str, ctx: &Context, depth: usize) -> Event {

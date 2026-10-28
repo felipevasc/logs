@@ -81,6 +81,8 @@ mod map_values;
 mod map_extract;
 mod enrichment_maps;
 mod map_columns;
+#[cfg(test)]
+mod format_baseline;
 mod map_lab;
 mod map_templates;
 mod advanced_fields;
@@ -1131,6 +1133,7 @@ pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
         ("w3c", "IIS / W3C"),
         ("zeek", "Zeek (TSV)"),
         ("auditd", "Linux auditd"),
+        ("labeled", "Rótulo: valor (campos separados por tabulação ou espaços)"),
         ("text", "Texto puro"),
     ]
     .into_iter()

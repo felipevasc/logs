@@ -30,9 +30,10 @@ await page.addInitScript(() => {
       const trace = { rules: [], outputs: [], conflicts: [] };
       for (const r of rules) {
         const source = r.extract.kind === "grok" ? toRegex(r.extract.patterns[0], map.grokPatterns) : r.extract.pattern;
-        let m = null;
+        let m = null, joined = null;
         try { m = new RegExp(source, "d").exec(text); } catch { /* inválida */ }
-        const extracted = m ? Object.entries(m.groups || {}).map(([n, v]) => [n, v, m.indices.groups[n]]) : [];
+        if (m && r.extract.all) { const every = [...text.matchAll(new RegExp(source, "g"))]; joined = {}; for (const n of Object.keys(m.groups || {})) joined[n] = every.map((x) => x.groups[n]).filter((v) => v != null).join(", "); }
+        const extracted = m ? Object.entries(m.groups || {}).map(([n, v]) => [n, joined?.[n] ?? v, m.indices.groups[n]]) : [];
         trace.rules.push({ rule: r.id, eligible: true, extraction: m ? "recognized" : "not_recognized", extracted });
         for (const [field, mapping] of Object.entries(r.fields || {})) {
           const hit = extracted.find(([n]) => n === mapping.from[0]);
@@ -63,7 +64,7 @@ await page.addInitScript(() => {
         return { isSample: true, population: 80400, examined: samples.length, field: r.field, seed: 1, samples, distribution: Object.keys(files).map((p) => ({ file: p, fileName: files[p].name, records: p.endsWith("access.log") ? 71000 : 9400, selected: 3 })), shapes: [] };
       }
       case "map_frame": return { format: "mixed", detected: r.path.endsWith("app.log") ? "^\\d{4}-\\d\\d-\\d\\d " : null, pattern: r.pattern || null, records: (r.pattern === "^BAD" ? [] : java.slice(0, 2).map((text, i) => ({ offset: String(i), text, lines: text.split("\n").length }))), more: false };
-      case "map_verify": return { results: r.patterns.map((p) => { try { const re = new RegExp(p, "d"); return { error: null, ranges: r.texts.map((t) => { const m = re.exec(t); return m && m.indices[1] ? m.indices[1] : null; }) }; } catch (e) { return { error: String(e), ranges: [] }; } }) };
+      case "map_verify": return { results: r.patterns.map((p) => { try { const re = new RegExp(p, "d"); return { error: null, ranges: r.texts.map((t) => { const m = re.exec(t); return m && m.indices[1] ? m.indices[1] : null; }), ...(r.counts ? { counts: r.texts.map((t) => [...t.matchAll(new RegExp(p, "g"))].length) } : {}) }; } catch (e) { return { error: String(e), ranges: [] }; } }) };
       case "map_evaluate": return evaluate(JSON.parse(r.map_json), r.samples.map((s) => textsOf[s.event_ref]));
       case "map_try": return evaluate(JSON.parse(r.map_json), r.texts);
       case "map_diff": return { recompute: true, global: false, added: [], removed: [], changed: [], unchanged: [], rulesAdded: [], rulesRemoved: [], rulesChanged: [], indexesToRebuild: [], metadataOnly: false };
@@ -138,6 +139,20 @@ try {
   const wrong = await page.evaluate(() => { const d = ExtractionColumns.state.draft, rec = ExtractionColumns.state.recs[d.rec].text; return d.cands.filter((c) => { const m = new RegExp(c.re, "d").exec(rec); return !(c.part ? m : m && m.indices[1][0] === d.s && m.indices[1][1] === d.e); }).length; });
   assert.equal(wrong, 0, "nenhuma sugestão deixa de reproduzir a seleção");
 
+  // 3b. Várias ocorrências no registro: a opção só aparece quando o motor contou mais de uma.
+  assert.ok(await page.evaluate(() => window.__calls.filter((c) => c.action === "map_verify").every((c) => c.counts === true)), "a verificação pede as contagens");
+  await page.evaluate(() => { const d = ExtractionColumns.state.draft; d.cands[d.pick].counts = d.cands[d.pick].counts.map(() => 1); });
+  await page.locator("#cx-new .cx-opt").first().click();
+  assert.equal(await page.locator("#cx-every").count(), 0, "uma só ocorrência: sem a opção");
+  await page.evaluate(() => { const d = ExtractionColumns.state.draft; d.cands[d.pick].counts = d.cands[d.pick].counts.map(() => 3); });
+  await page.locator("#cx-new .cx-opt").first().click();
+  await page.waitForSelector("#cx-every");
+  assert.match(await page.locator(".cx-every").innerText(), /aparece 3 vezes/);
+  await page.check("#cx-every");
+  assert.equal(await page.locator("#cx-m-regex").getAttribute("aria-pressed"), "true", "todas as ocorrências só existem em Regex");
+  await page.uncheck("#cx-every");
+  await page.locator("#cx-new .cx-opt").first().click();
+
   // 4. Nome fácil: sugestão de nome em um clique, e o tipo vem de um seletor com busca.
   assert.ok((await page.locator("#cx-new .cx-sugg button").count()) >= 1);
   await page.fill("#cx-nameinput", "filial");
@@ -168,6 +183,23 @@ try {
   await page.waitForFunction(() => document.querySelector("#cx-rows .tag.warn") === null);
 
   // 5. Outra coluna por clique num pedaço sublinhado; o seletor de nome sugere e a regra nova convive.
+  await page.locator("#cx-record .cx-m.cand").first().click();
+  await page.waitForSelector("#cx-new.draft .cx-opt");
+  // 5b. Todas as ocorrências: a coluna vira Regex com `all`, tipo texto e a marca "lista" na tabela.
+  await page.evaluate(() => { const d = ExtractionColumns.state.draft; d.cands[d.pick].counts = d.cands[d.pick].counts.map(() => 3); });
+  await page.locator("#cx-new .cx-opt").first().click();
+  await page.check("#cx-every");
+  await page.fill("#cx-nameinput", "varios");
+  await page.click("#cx-d-ok");
+  await page.waitForFunction(() => Extraction.state.def.rules.some((r) => r.id === "col-varios"));
+  const everyRule = await page.evaluate(() => Extraction.state.def.rules.find((r) => r.id === "col-varios"));
+  assert.equal(everyRule.extract.kind, "regex");
+  assert.equal(everyRule.extract.all, true);
+  assert.equal(everyRule.fields.varios.type, "text");
+  assert.match(await page.locator('#cx-rows tr[data-c="varios"]').innerText(), /lista/);
+  await page.locator('#cx-rows tr[data-c="varios"]').click({ button: "right" });
+  await page.locator("#cx-menu", { hasText: "Remover coluna" }).getByText("Remover coluna").click();
+  await page.waitForFunction(() => !Extraction.state.def.rules.some((r) => r.id === "col-varios"));
   await page.locator("#cx-record .cx-m.cand").first().click();
   await page.waitForSelector("#cx-new.draft .cx-opt");
   await page.click("#cx-d-cancel");

@@ -109,6 +109,9 @@ pub(crate) enum Request {
     MapVerify {
         texts: Vec<String>,
         patterns: Vec<String>,
+        /// Also count the occurrences per text (up to 50), for "use every occurrence".
+        #[serde(default)]
+        counts: bool,
     },
     /// The draft applied to sample records, with ranges and per-output states.
     MapEvaluate {
@@ -597,7 +600,7 @@ fn execute(state: &AppState, request: Request, filters: &[Filter]) -> Result<Val
             let physical = physical.ok_or("O arquivo não pertence à fonte ativa.")?;
             crate::map_columns::frame(&physical, pattern.as_deref(), count.unwrap_or(60))
         }
-        Request::MapVerify { texts, patterns } => crate::map_columns::verify(&texts, &patterns),
+        Request::MapVerify { texts, patterns, counts } => crate::map_columns::verify(&texts, &patterns, counts),
         Request::MapEvaluate { map_json, samples } => {
             crate::map_lab::evaluate_samples(state, &map_json, samples)
         }

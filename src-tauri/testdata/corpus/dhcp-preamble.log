@@ -1,0 +1,10 @@
+Microsoft DHCP Service Activity Log
+
+Event ID  Meaning
+00        The log was started.
+
+ID,Date,Time,Description,IP Address,Host Name,MAC Address
+30,10/12/26,00:00:01,DNS Update Request,10.0.0.5,pc01.example.test,001122334455
+10,10/12/26,00:00:02,Assign,10.0.0.6,pc02.example.test,001122334466
+11,10/12/26,00:00:03,Renew,10.0.0.5,pc01.example.test,001122334455
+12,10/12/26,00:00:04,Release,10.0.0.6,pc02.example.test,001122334466

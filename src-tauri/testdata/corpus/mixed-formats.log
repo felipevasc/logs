@@ -1,0 +1,5 @@
+2026-10-12 00:00:01 INFO app started
+{"ts":"2026-10-12T00:00:02Z","level":"error","msg":"boom"}
+Oct 12 00:00:03 srv01 sshd[9]: session opened
+ts=2026-10-12T00:00:04Z level=warn msg=slow
+just a plain line

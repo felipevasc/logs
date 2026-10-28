@@ -1,0 +1,4 @@
+level: info  msg: request done  status: 200
+level: error  msg: db timeout  status: 500
+level: warn  msg: slow query  status: 200
+level: info  msg: request done  status: 201

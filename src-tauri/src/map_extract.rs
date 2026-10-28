@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 
 /// Largest subject an extraction will read. Longer records are reported, never truncated silently.
 pub(crate) const SUBJECT_LIMIT: usize = 256 << 10;
+/// Occurrences kept when a regular expression extracts every match of a record.
+pub(crate) const ALL_LIMIT: usize = 200;
 
 fn message() -> String {
     "message".into()
@@ -82,6 +84,9 @@ pub(crate) enum Extraction {
         case_sensitive: bool,
         #[serde(default = "message")]
         source: String,
+        /// Every occurrence in the subject, joined with ", " (default: the first one only).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all: bool,
     },
 }
 impl Extraction {
@@ -124,7 +129,7 @@ enum Plan {
     Xml(BTreeMap<String, String>),
     Delimited { delimiter: String, quote: Option<char>, columns: Vec<String> },
     KeyValue { pair: String, separator: String, quote: Option<char>, keys: BTreeMap<String, String> },
-    Regex { matcher: Matcher, names: Vec<(usize, String)> },
+    Regex { matcher: Matcher, names: Vec<(usize, String)>, all: bool },
 }
 pub(crate) struct Compiled {
     plan: Plan,
@@ -218,7 +223,7 @@ impl Compiled {
                 }
                 Plan::KeyValue { pair: pair_delimiter.clone(), separator: separator.clone(), quote: single_char(quote, "A aspa").map_err(plain)?, keys: keys.clone() }
             }
-            Extraction::Regex { pattern, engine, case_sensitive, .. } => {
+            Extraction::Regex { pattern, engine, case_sensitive, all, .. } => {
                 if !["pcre2", "rust"].contains(&engine.as_str()) {
                     return Err(plain("Use o motor pcre2 ou rust.".into()));
                 }
@@ -227,7 +232,7 @@ impl Compiled {
                 if names.is_empty() {
                     return Err(plain("Use grupos nomeados, como (?<usuario>\\w+), para dar nome aos campos.".into()));
                 }
-                Plan::Regex { matcher, names }
+                Plan::Regex { matcher, names, all: *all }
             }
         };
         Ok(Self { plan, spec: spec.clone() })
@@ -259,7 +264,23 @@ impl Compiled {
             Plan::Xml(paths) => xml(paths, subject),
             Plan::Delimited { delimiter, quote, columns } => Ok(delimited(delimiter, *quote, columns, subject)),
             Plan::KeyValue { pair, separator, quote, keys } => Ok(key_value(pair, separator, *quote, keys, subject)),
-            Plan::Regex { matcher, names } => Ok(matcher.first_ranges(subject)?.map(|ranges| Extracted {
+            Plan::Regex { matcher, names, all: true } => {
+                let found = matcher.all_ranges(subject, ALL_LIMIT)?;
+                if found.is_empty() {
+                    return Ok(None);
+                }
+                let items = names
+                    .iter()
+                    .filter_map(|(group, name)| {
+                        let ranges: Vec<(usize, usize)> = found.iter().filter_map(|r| r.get(*group).copied().flatten()).collect();
+                        let first = *ranges.first()?;
+                        let value = ranges.iter().map(|&(a, b)| &subject[a..b]).collect::<Vec<_>>().join(", ");
+                        Some(Item { name: name.clone(), value, range: Some(first), conv: None })
+                    })
+                    .collect();
+                Ok(Some(Extracted { alternative: None, items }))
+            }
+            Plan::Regex { matcher, names, .. } => Ok(matcher.first_ranges(subject)?.map(|ranges| Extracted {
                 alternative: None,
                 items: names.iter().filter_map(|(group, name)| ranges.get(*group).copied().flatten().map(|(a, b)| Item { name: name.clone(), value: subject[a..b].to_owned(), range: Some((a, b)), conv: None })).collect(),
             })),
@@ -566,10 +587,29 @@ mod tests {
     }
     #[test]
     fn regex_extraction_needs_named_groups_and_reports_ranges() {
-        assert!(Compiled::new(&Extraction::Regex { pattern: "(\\d+)".into(), engine: "pcre2".into(), case_sensitive: true, source: "message".into() }, &BTreeMap::new()).is_err());
-        let c = compile(Extraction::Regex { pattern: "(?<=user=)(?<usuario>\\w+)".into(), engine: "pcre2".into(), case_sensitive: true, source: "message".into() });
+        assert!(Compiled::new(&Extraction::Regex { pattern: "(\\d+)".into(), engine: "pcre2".into(), case_sensitive: true, source: "message".into(), all: false }, &BTreeMap::new()).is_err());
+        let c = compile(Extraction::Regex { pattern: "(?<=user=)(?<usuario>\\w+)".into(), engine: "pcre2".into(), case_sensitive: true, source: "message".into(), all: false });
         let got = c.run("😀 user=ana").unwrap().unwrap();
         assert_eq!(got.items[0].value, "ana");
+    }
+    #[test]
+    fn a_regex_can_take_every_occurrence_of_a_record() {
+        let all = |pattern: &str, all: bool| compile(Extraction::Regex { pattern: pattern.into(), engine: "pcre2".into(), case_sensitive: true, source: "message".into(), all });
+        let text = "Ports: 80/open/tcp, 443/closed/tcp, 8080/open/tcp ação 9090/open/tcp";
+        let every = all(r"(?<porta>\d+)/open/", true).run(text).unwrap().unwrap();
+        assert_eq!(every.items[0].value, "80, 8080, 9090");
+        // the range is the first occurrence, so the page still highlights where it starts
+        let (a, b) = every.items[0].range.unwrap();
+        assert_eq!(&text[a..b], "80");
+        let first = all(r"(?<porta>\d+)/open/", false).run(text).unwrap().unwrap();
+        assert_eq!(first.items[0].value, "80");
+        assert!(all(r"(?<porta>\d+)/udp/", true).run(text).unwrap().is_none());
+        // look-behind sees what came before the previous match, and an empty match cannot loop
+        assert_eq!(all(r"(?<=, )(?<porta>\d+)", true).run(text).unwrap().unwrap().items[0].value, "443, 8080");
+        assert!(all(r"(?<vazio>x*)", true).run("abc").unwrap().is_some());
+        // an old definition (no `all`) reads and writes without the new key
+        let old: Extraction = serde_json::from_str(r#"{"kind":"regex","pattern":"(?<a>x)"}"#).unwrap();
+        assert!(!serde_json::to_string(&old).unwrap().contains("all"));
     }
     #[test]
     fn grok_reports_the_recognising_alternative_and_oversized_subjects_fail_loudly() {
