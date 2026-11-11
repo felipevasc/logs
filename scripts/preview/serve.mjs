@@ -89,6 +89,12 @@ const server = createServer(async (req, res) => {
         body.toString("utf8").replace(
           '<script src="app.js"></script>',
           '<script src="/__mock-field-transforms__.js"></script>\n  <script src="/__mock-exclusions__.js"></script>\n  <script src="/__mock-references__.js"></script>\n  <script src="/__mock-pivot__.js"></script>\n  <script src="/__mock-remote__.js"></script>\n  <script src="/__mock-journeys__.js"></script>\n  <script src="/__mock-native-case__.js"></script>\n  <script src="/__mock__.js"></script>\n  <script src="app.js"></script>',
+        // Runners with 4 cores would switch light mode on by themselves and still the
+        // animations that tests check; the preview behaves like a capable PC unless a
+        // test saves its own preference.
+        ).replace(
+          '<script src="analysis-preferences.js"></script>',
+          '<script>try { if (!localStorage.getItem("loginsight.preferences.v1")) localStorage.setItem("loginsight.preferences.v1", JSON.stringify({ lowPower: "off" })); } catch {}</script>\n  <script src="analysis-preferences.js"></script>',
         ),
       );
     }
