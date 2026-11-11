@@ -4,7 +4,9 @@ A navegação de **Análise** e **Caso** contém a página **Comprometimentos**.
 
 ## Cálculo sob demanda
 
-Importar logs, abrir ou trocar de Caso e navegar pelo Resumo, Comprometimentos ou Timeline **não inicia o cálculo**. Use **Calcular comprometimentos** no Resumo ou na página, ou a ação **Recalcular triagem** da paleta de comandos. Enquanto não houver cálculo, a interface informa **ainda não calculados**, sem confundir isso com uma análise concluída sem indícios.
+Por padrão, importar logs, abrir ou trocar de Caso e navegar pelo Resumo, Comprometimentos ou Timeline **não inicia o cálculo**. Use **Calcular comprometimentos** no Resumo ou na página, ou a ação **Recalcular triagem** da paleta de comandos. Enquanto não houver cálculo, a interface informa **ainda não calculados**, sem confundir isso com uma análise concluída sem indícios.
+
+Em **Configurações → Análise → Comprometimentos após importar** o cálculo pode começar sozinho quando uma fonte termina de carregar, somente até um limite de registros escolhido (padrão: 2 milhões). Fontes maiores mostram um aviso e continuam com o botão manual. Um resultado já salvo para os mesmos dados é reaberto, nunca recalculado. A preferência vale para este computador.
 
 O cálculo tem estado de execução e cancelamento; cliques repetidos e voltar à página compartilham a mesma operação. Cancelar interrompe cooperativamente o trabalho nativo e nunca aplica uma resposta parcial ou atrasada. Trocar de Caso ou alterar dados/regras impede que a resposta antiga entre no contexto novo. Falhas têm uma ação explícita para tentar novamente.
 
@@ -14,7 +16,7 @@ Essas contagens são uma **prévia provisória**, sem publicar eventos ou uma an
 
 Resultados completos são salvos automaticamente, tanto para fontes quanto para registros preservados no Caso. Ao voltar à página, trocar de Caso ou reabrir a aplicação, a interface busca o resultado salvo com uma consulta **somente ao cache**, sem recalcular. A ausência de resultado mantém o botão de cálculo explícito. Dados, regras, referências, interpretação de horários e visibilidade fazem parte da identidade; mudanças reais exigem nova análise, mas navegação, contadores da sessão e atualizações compatíveis da aplicação não a invalidam. Análises de outros Casos não são apagadas ao concluir novos cálculos. Paginação e detalhes reabrem o armazenamento quando necessário, sem depender de um resultado ainda presente na memória. Um resultado nunca aparece em outro Caso.
 
-Depois do cálculo, o Resumo exibe um gráfico dos indícios de comprometimento por nível. Cada barra conta **achados naquele nível**, não eventos nem episódios. O botão abre a página; clicar em uma barra escolhe aquele nível mínimo. A página abre inicialmente em **Quase confirmado**. O controle é cumulativo e preserva sua seleção no mesmo universo. A área de cada Caso conserva seu nível mínimo, sua seção e sua seleção de tática ao alternar contextos e reabrir a aplicação.
+Depois do cálculo, o Resumo exibe um gráfico dos indícios de comprometimento por nível. Cada barra conta **achados naquele nível**, não eventos nem episódios. O botão abre a página; clicar em uma barra escolhe aquele nível mínimo. A página abre no **nível mais alto que tem indícios**: se não houver nada em Quase confirmado, mas houver em Indício, ela abre em Indício, em vez de uma tela vazia. Sem nenhum indício, abre em Quase confirmado. Depois que o analista escolhe um nível, a escolha prevalece. O controle é cumulativo e preserva sua seleção no mesmo universo. A área de cada Caso conserva seu nível mínimo, sua seção e sua seleção de tática ao alternar contextos e reabrir a aplicação.
 
 | Valor do contrato | Nome na interface e nos relatórios |
 |---|---|
@@ -32,7 +34,7 @@ Quando há identificação nos logs, o item mostra minicards de **Atacante** e *
 
 O episódio apresenta o trecho principal que motivou o alerta. Ao abrir o episódio e usar **Ver eventos**, o recorte principal passa a representar a detecção selecionada e aparecem seus membros exatos, sem duplicar o trecho. Cada evento abre dentro da página, com metadados, todos os campos (inclusive objetos) e conteúdo bruto. Listas grandes carregam os membros progressivamente. Botão direito no evento oferece **Filtrar este evento no Explorar**; no episódio ou indício permite filtrar todos os seus membros.
 
-O backend fornece `excerpts`: referência de evento, campo, transformação, offsets em bytes, contexto anterior/posterior, correspondência e indicadores de corte. Os offsets referem-se ao valor após a transformação indicada. Não se inventam trechos para negações, ausência de eventos ou junções. Quando um recorte não está disponível, a interface informa isso e apresenta os eventos e as condições. Os recortes são limitados a oito por achado, 80 caracteres de contexto de cada lado e 400 caracteres de correspondência. Isso não limita o acesso ao evento original.
+O backend fornece `excerpts`: referência de evento, campo, transformação, offsets em bytes, contexto anterior/posterior, correspondência e indicadores de corte. Os offsets referem-se ao valor após a transformação indicada. Não se inventam trechos para negações, ausência de eventos ou junções. Correlações (contagens, sequências, beacons, razões, agregações e comportamento) recebem em `measurements.narrative` uma frase com os fatos medidos, mostrada em **O que foi medido** no lugar do trecho. Exemplo: `5 falhas → 1 sucesso em 3.3 min (origem 203.0.113.7, conta root)`. Viagens dizem os países, a distância mínima, os minutos e a velocidade; respostas anômalas dizem o tamanho, a mediana do endereço e quantas respostas comuns formam essa mediana. Em sequências, `measurements.step_counts` traz quantos membros cada etapa tem. Quando nem trecho nem frase estão disponíveis, a interface informa isso e apresenta os eventos e as condições. Os recortes são limitados a oito por achado, 80 caracteres de contexto de cada lado e 400 caracteres de correspondência. Isso não limita o acesso ao evento original.
 
 HTML e comandos dos logs são tratados como texto. Senhas, hashes de `shadow` e blocos de chaves privadas são protegidos na apresentação; o evento original não é modificado. O endpoint `triage_evidence_event` verifica análise, pertencimento e referência antes de retornar o evento. Salvar no Caso usa a mesma verificação e preserva achado, recortes, relações e limitações.
 
@@ -47,6 +49,44 @@ Cada registro com user agent recebe campos pesquisáveis: `ua.class`, `ua.family
 Não existe lista oficial de todos os user agents: cada versão de navegador gera textos novos e qualquer cliente pode enviar qualquer texto. Por isso a declaração de navegador é conferida contra o que os navegadores reais enviam: a gramática de cada motor (Blink com `AppleWebKit/537.36 (KHTML, like Gecko) … Safari/537.36`, Gecko com `rv:` igual à versão, Safari só em sistemas da Apple), os tokens que eles congelam (Windows 11 envia `Windows NT 10.0`; Chrome 117+ envia macOS `10_15_7`; Firefox 117+ envia macOS `10.15`), versões que existiam **na data do registro** (cadência de lançamentos de Chrome, Edge, Firefox e Safari), sistemas que a versão não suporta (Chrome 110+ e Firefox 116+ em Windows 7/8) e combinações impossíveis (Chrome/ no iPhone em vez de CriOS, Edge com Chromium diferente, produto repetido, plataformas contraditórias). Versões anos atrás da atual, navegadores descontinuados, payloads de ataque, caracteres de controle e textos aleatórios também são anotados.
 
 A seção mostra **Quem acessou**: registros e origens por classe, os clientes de cada classe, os motivos de navegadores impossíveis e os user agents impossíveis mais frequentes. Cada linha filtra os registros no Explorar; o botão direito também abre a linha do tempo. Duas regras alimentam a seção: **Navegador forjado ou impossível** (`client.forged-browser`, nível Suspeita) e **Ferramenta de ataque em uso** (`client.offensive-tool`, 20 requisições em 10 minutos, nível Suspeita). Um user agent pode ser forjado para parecer comum: ausência de anomalia não prova que o cliente é um navegador, e um cliente incomum não demonstra ataque.
+
+## Resultado HTTP, webshells, sessões e localização
+
+A normalização (`normalization-8`) acrescenta campos derivados aos registros web, de autenticação e de rede:
+
+| Campo | Conteúdo |
+|---|---|
+| `_sec.http.status`, `_sec.http.status_class` | Código de resposta e classe (`2xx`, `4xx`, `5xx`…) |
+| `_sec.http.bytes`, `_sec.http.method` | Tamanho da resposta e método |
+| `_sec.url.path` | Caminho sem parâmetros (somente registros web) |
+| `_sec.web.script` | O caminho termina em script executável no servidor (`.php`, `.jsp`, `.aspx`, `.cgi`…) |
+| `_sec.web.upload_dir` | O caminho passa por um diretório de envio ou mídia (`uploads`, `files`, `images`, `media`, `tmp`…) |
+| `_sec.web.attack` | A requisição traz payload reconhecido (injeção, travessia, shell reverso…) |
+| `_sec.web.session` | Sessão da aplicação: nome do cookie ou campo e o identificador |
+| `_sec.geo.country`, `_sec.geo.asn`, `_sec.geo.as_org`, `_sec.geo.hosting` | País, sistema autônomo e provedor de nuvem ou hospedagem, somente com a base de localização instalada |
+
+Um novo tipo de regra, `behavior`, compara cada grupo com o histórico do próprio conjunto de dados. Modelos: `new_value` (valor nunca visto depois de um histórico mínimo), `travel` (distância mínima entre países incompatível com o tempo), `new_endpoint` (script que surge tarde no período, usado por poucas origens e principalmente com POST), `appeared` (caminho que só respondia 404 e passou a responder 2xx) e `size_outlier` (resposta muito maior que a mediana do mesmo endereço nas respostas comuns). O pacote `src-tauri/resources/detection-behavior.json` traz doze regras experimentais:
+
+| Regra | O que aponta | Nível |
+|---|---|---|
+| `web.attack.server-error` | Payload de ataque que provocou erro 5xx | Forte indício |
+| `web.attack.size-outlier` | Payload de ataque com resposta muito maior que o normal do endereço (efeito) | Forte indício |
+| `web.script-appeared` | Script que respondia 404 e passou a existir | Indício |
+| `webshell.upload-dir-script` | Script executado com sucesso dentro de diretório de envio | Indício |
+| `webshell.new-script` | Script novo, de poucas origens, principalmente POST | Indício |
+| `webshell.upload-then-script` | Envio de arquivo seguido de acesso a script novo pela mesma origem em 30 min | Forte indício |
+| `session.multi-browser` | Mesma sessão usada por dois clientes diferentes em 1 h | Indício |
+| `session.multi-country` | Mesma sessão vinda de países diferentes | Indício |
+| `session.multi-ip` | Mesma sessão vinda de três IPs em 30 min | Suspeita |
+| `geo.new-country` | Conta acessando de país nunca visto depois de pelo menos cinco acessos | Suspeita |
+| `geo.impossible-travel` | Dois acessos da mesma conta mais distantes do que 1000 km/h permitiriam (mínimo de 500 km) | Indício |
+| `geo.hosting-login` | Login bem-sucedido a partir de provedor de nuvem ou hospedagem | Suspeita |
+
+As regras de webshell entram em **Upload e webshells**; as de sessão e localização, em **Credenciais e contas**; o erro e a resposta anômala, em **Ataques a aplicações web** e **Vazamento de dados**. Sessões compartilhadas por NAT, proxies corporativos, VPNs e trocas de rede móvel são alternativas benignas registradas em cada regra.
+
+### Localização de IPs
+
+A base fica em **Configurações → Análise → Localização de IPs**. **Baixar base gratuita** busca o arquivo `ip2asn-combined.tsv.gz` de iptoasn.com (domínio público) somente quando o analista clica; **Importar arquivo** aceita ip2asn (TSV, opcionalmente `.gz`) e DB-IP country/ASN (CSV). Os arquivos ficam na pasta `geoip` das configurações do usuário. Durante a análise nada é consultado na internet. IPs privados, reservados e de documentação não são localizados. A distância usa centroides de países com margem (1500 km para países extensos, 300 km para os demais), por isso é sempre um mínimo. Instalar, trocar ou remover a base muda a identidade da normalização e dos resultados: é preciso recalcular. Sem base, as regras de país e distância ficam sem dados e aparecem como cobertura insuficiente.
 
 ## Trinta regras contextuais
 

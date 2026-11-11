@@ -11,6 +11,8 @@ window.EvidenceUI = (() => {
   const outcome = value => ({ success: "operação bem-sucedida", failure: "falha", blocked: "bloqueado", unknown: "resultado desconhecido", mixed: "resultados distintos" }[value] || "resultado desconhecido");
   const claim = value => ({attempt:"Tentativa observada",execution:"Execução observada",effect:"Efeito observado",activity:"Atividade observada"}[value] || "Atividade observada");
   function excerpts(d, limit = 3) {
+    const narrative = typeof d.measurements?.narrative === "string" ? d.measurements.narrative : "";
+    if (!d.excerpts?.length && narrative) return `<section class="sec-excerpts sec-narrative" aria-label="Medidas que motivaram o indício"><strong>O que foi medido</strong><p>${esc(redact(narrative))}</p></section>`;
     if (!d.excerpts?.length) return '<p class="sec-no-excerpt">Não há trecho textual preservado neste achado. Consulte os eventos, as relações e as condições abaixo.</p>';
     return `<section class="sec-excerpts" aria-label="Trechos que motivaram o indício"><strong>O que chamou atenção</strong>${d.excerpts.slice(0, limit).map(x => {
       // Mask the complete excerpt before splitting so secrets cannot leak across a mark boundary.

@@ -170,29 +170,14 @@ pub struct AttackRef {
 }
 
 pub const VERSION: &str = "19.2";
-struct StixIndex { objects: std::collections::HashMap<String, serde_json::Value>, replacements: std::collections::HashMap<String,String> }
+#[derive(serde::Deserialize)]
+struct StixTechnique { name: String, tactics: Vec<String> }
+/// Generated at build time from `resources/attack-enterprise-v19.2.json` (see build.rs).
+#[derive(serde::Deserialize)]
+struct StixIndex { techniques: std::collections::HashMap<String, StixTechnique>, replacements: std::collections::HashMap<String,String> }
 fn stix() -> &'static StixIndex {
     static INDEX: std::sync::OnceLock<StixIndex> = std::sync::OnceLock::new();
-    INDEX.get_or_init(|| {
-        let bundle: serde_json::Value = serde_json::from_str(include_str!("../resources/attack-enterprise-v19.2.json")).expect("versioned ATT&CK STIX bundle");
-        let mut objects = std::collections::HashMap::new();
-        let mut ids = std::collections::HashMap::new();
-        let all = bundle["objects"].as_array().expect("STIX objects");
-        for object in all {
-            if object["type"] != "attack-pattern" { continue; }
-            if let Some(id) = object["external_references"].as_array().into_iter().flatten().find(|r| r["source_name"] == "mitre-attack").and_then(|r| r["external_id"].as_str()) {
-                ids.insert(object["id"].as_str().unwrap_or_default().to_string(), id.to_string());
-                objects.insert(id.to_string(), object.clone());
-            }
-        }
-        let mut replacements = std::collections::HashMap::new();
-        for object in all {
-            if object["relationship_type"] == "revoked-by" {
-                if let (Some(a),Some(b)) = (object["source_ref"].as_str().and_then(|v| ids.get(v)),object["target_ref"].as_str().and_then(|v| ids.get(v))) { replacements.insert(a.clone(),b.clone()); }
-            }
-        }
-        StixIndex { objects, replacements }
-    })
+    INDEX.get_or_init(|| serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/attack-index.json"))).expect("ATT&CK index"))
 }
 
 pub fn tactic(key: &str) -> Option<&'static Tactic> {
@@ -221,10 +206,10 @@ pub fn reference(id: &str, extra_tactics: &[String]) -> AttackRef {
     let mut current = upper.clone();
     let mut seen = std::collections::HashSet::new();
     while seen.insert(current.clone()) { if let Some(next) = index.replacements.get(&current) { current = next.clone(); } else { break; } }
-    if let Some(object) = index.objects.get(&current) {
-        let mut tactics: Vec<_> = object["kill_chain_phases"].as_array().into_iter().flatten().filter(|p| p["kill_chain_name"] == "mitre-attack").filter_map(|p| p["phase_name"].as_str().map(str::to_string)).collect();
+    if let Some(object) = index.techniques.get(&current) {
+        let mut tactics = object.tactics.clone();
         tactics.sort_by_key(|t| tactic_order(t));
-        let name = TECHNIQUES.iter().find(|t| t.id == current).map(|t| t.name.to_string()).unwrap_or_else(|| object["name"].as_str().unwrap_or(&current).to_string());
+        let name = TECHNIQUES.iter().find(|t| t.id == current).map(|t| t.name.to_string()).unwrap_or_else(|| object.name.clone());
         return AttackRef { original_id: (current != upper).then_some(upper), id: current, name, tactics, version: VERSION.into() };
     }
     match technique(&upper) {

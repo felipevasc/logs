@@ -20,9 +20,10 @@ const EXPANSION: &str = include_str!("../resources/detection-expansion.json");
 const ADVANCED: &str = include_str!("../resources/detection-advanced.json");
 const CONTENT: &str = include_str!("../resources/detection-content.json");
 const CLIENTS: &str = include_str!("../resources/detection-clients.json");
+const BEHAVIOR: &str = include_str!("../resources/detection-behavior.json");
 fn builtin_defs() -> Result<Vec<RuleDef>, String> {
     let mut rules = Vec::new();
-    for text in [BUILTIN, EXPANSION, ADVANCED, CONTENT, CLIENTS] {
+    for text in [BUILTIN, EXPANSION, ADVANCED, CONTENT, CLIENTS, BEHAVIOR] {
         rules.extend(serde_json::from_str::<RuleFile>(text).map_err(|e| e.to_string())?.rules);
     }
     Ok(rules)
@@ -45,6 +46,45 @@ pub struct StepDef {
     pub rules: Vec<String>,
     #[serde(default)]
     pub count: Option<usize>,
+    /// Short name of the step used in the finding's sentence ("falhas", "sucesso").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Parameters of a `behavior` rule: patterns over a whole group of events
+/// (an identity, a URL path) instead of a time window.
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorDef {
+    /// `new_value`, `travel`, `appeared`, `new_endpoint` or `size_outlier`.
+    pub model: String,
+    /// Value followed by the model: country, response bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// `size_outlier`: condition of the ordinary responses forming the baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
+    /// `new_endpoint`: field holding the HTTP method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_history: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sources: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_fraction: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_delta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_kmh: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_km: Option<f64>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -141,6 +181,8 @@ pub struct RuleDef {
     pub coverage: Option<String>,
     #[serde(default)]
     pub bindings: Vec<BindingDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<BehaviorDef>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +209,9 @@ pub struct Compiled {
     contrary: Option<Expr>,
     numerator: Option<Expr>,
     pub(crate) chain_references:Vec<String>,
+    behavior_field: Option<FieldRef>,
+    behavior_method: Option<FieldRef>,
+    baseline: Option<Expr>,
 }
 
 impl Compiled {
@@ -260,7 +305,7 @@ pub fn compile_rule(def: RuleDef, origin: &'static str, conds: Option<Vec<Expr>>
     let contrary = if def.unless.trim().is_empty() { None } else { Some(querylang::compile_rule(&def.unless)?) };
     if !matches!(
         kind,
-        "single" | "threshold" | "distinct" | "sequence" | "temporal" | "beacon" | "ratio" | "aggregate" | "absence"
+        "single" | "threshold" | "distinct" | "sequence" | "temporal" | "beacon" | "ratio" | "aggregate" | "absence" | "behavior"
     ) {
         return Err(format!("Tipo de regra inválido em {}: {kind}", def.id));
     }
@@ -344,8 +389,32 @@ pub fn compile_rule(def: RuleDef, origin: &'static str, conds: Option<Vec<Expr>>
             return Err("Agregação inválida; operações suportadas: sum, avg, min, max".into());
         }
     }
+    let behavior = def.behavior.as_ref();
+    if (kind == "behavior") != behavior.is_some() {
+        return Err(format!("A regra {} declara behavior somente com kind behavior.", def.id));
+    }
+    let mut baseline = None;
+    if let Some(b) = behavior {
+        let positive = |v: Option<f64>| v.is_none_or(|v| v.is_finite() && v >= 0.0);
+        if !positive(b.min_ratio) || !positive(b.late_fraction) || !positive(b.factor) || !positive(b.min_delta) || !positive(b.max_kmh) || !positive(b.min_km)
+            || b.min_ratio.is_some_and(|v| v > 1.0) || b.late_fraction.is_some_and(|v| v >= 1.0)
+        {
+            return Err(format!("Parâmetros inválidos no comportamento de {}.", def.id));
+        }
+        match b.model.as_str() {
+            "new_value" | "travel" | "appeared" if b.field.is_some() => {}
+            "new_endpoint" if def.distinct.is_some() => {}
+            "size_outlier" if b.field.is_some() && b.baseline.is_some() => {
+                baseline = Some(querylang::compile_rule(b.baseline.as_deref().unwrap()).map_err(|e| format!("{}: {e}", def.id))?);
+            }
+            _ => return Err(format!("Comportamento inválido em {}: new_value/travel exigem field, new_endpoint exige distinct e size_outlier exige field e baseline.", def.id)),
+        }
+    }
     let attack = def.attack.iter().map(|id| attack::reference(id, &def.tactics)).collect();
     Ok(Compiled {
+        behavior_field: behavior.and_then(|b| b.field.as_deref()).map(querylang::field_ref),
+        behavior_method: behavior.and_then(|b| b.method_field.as_deref()).map(querylang::field_ref),
+        baseline,
         enabled: true,
         by: def.by.iter().map(|c| querylang::field_ref(c)).collect(),
         step_by: def
@@ -897,6 +966,40 @@ struct Acc {
     duplicates: usize,
     clipped: usize,
     stats_bytes: usize,
+    /// `size_outlier` baselines per (rule, group key): log-scale response sizes.
+    baselines: HashMap<(u32, Box<str>), Histogram>,
+}
+
+/// Approximate distribution of values in half-octave buckets (ratio √2).
+#[derive(Default)]
+struct Histogram {
+    buckets: Vec<(u8, u32)>,
+    samples: u32,
+}
+impl Histogram {
+    fn bucket(value: u64) -> u8 {
+        (((value as f64) + 1.0).log2() * 2.0).floor().min(255.0) as u8
+    }
+    fn add(&mut self, value: u64) {
+        let b = Self::bucket(value);
+        match self.buckets.binary_search_by_key(&b, |e| e.0) {
+            Ok(i) => self.buckets[i].1 = self.buckets[i].1.saturating_add(1),
+            Err(i) => self.buckets.insert(i, (b, 1)),
+        }
+        self.samples = self.samples.saturating_add(1);
+    }
+    /// Upper bound of the median bucket: conservative when looking for larger values.
+    fn median_upper(&self) -> Option<f64> {
+        let half = self.samples.div_ceil(2);
+        let mut seen = 0u32;
+        for &(b, n) in &self.buckets {
+            seen += n;
+            if seen >= half {
+                return Some(2f64.powf((b as f64 + 1.0) / 2.0) - 1.0);
+            }
+        }
+        None
+    }
 }
 
 impl Acc {
@@ -928,6 +1031,7 @@ impl Acc {
             duplicates: 0,
             clipped: 0,
             stats_bytes: 0,
+            baselines: HashMap::new(),
         })
     }
 }
@@ -951,6 +1055,30 @@ fn basename(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
 }
 
+/// Batch bounds of the interpretation pass: large enough for parallel waves,
+/// small enough to keep the working set modest on machines with little memory.
+const BATCH_EVENTS: usize = 4096;
+const BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// Cheap size estimate of an event, used only to bound a batch.
+fn approximate_bytes(ev: &Event) -> usize {
+    fn value(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::String(s) => s.len() + 8,
+            serde_json::Value::Array(a) => a.iter().map(value).sum::<usize>() + 16,
+            serde_json::Value::Object(o) => o.iter().map(|(k, v)| k.len() + value(v)).sum::<usize>() + 16,
+            _ => 16,
+        }
+    }
+    ev.raw.len() + ev.message.len() + ev.source.len() + ev.fields.iter().map(|(k, v)| k.len() + value(v)).sum::<usize>() + 256
+}
+
+/// Pure per-event results computed in parallel before the ordered pass.
+struct Prepared {
+    literals: Option<Vec<u32>>,
+    catalog: Option<crate::threats::Scan>,
+}
+
 fn event_text(ev: &Event) -> String {
     let mut text = String::with_capacity(ev.message.len() + ev.raw.len().min(4096) + 64);
     for part in [&ev.message, &ev.source, &ev.code, &ev.raw] {
@@ -968,7 +1096,12 @@ fn event_text(ev: &Event) -> String {
         }
         text.push('\n');
     }
-    text.to_lowercase()
+    if text.is_ascii() {
+        text.make_ascii_lowercase();
+        text
+    } else {
+        text.to_lowercase()
+    }
 }
 
 struct Pass<'a> {
@@ -982,16 +1115,35 @@ struct Pass<'a> {
 }
 
 impl Pass<'_> {
+    /// Pure per-event work, computed in parallel before the ordered pass.
+    fn prepare(&self, ev: &Event) -> Prepared {
+        let literals = self.rules.automaton.as_ref().map(|automaton| {
+            let text = event_text(ev);
+            let mut found: Vec<u32> = automaton.find_overlapping_iter(&text).map(|m| m.pattern().as_u32()).collect();
+            found.sort_unstable();
+            found.dedup();
+            found
+        });
+        let catalog = self
+            .catalog
+            .filter(|_| ev.fields.get("_sec.literal_output").and_then(|v| v.as_str()) != Some("true"))
+            .map(|catalog| catalog.scan(ev));
+        Prepared { literals, catalog }
+    }
     fn flush_predicates(&self, acc:&mut Acc, columnar:&mut crate::security_plan::Columnar,
         events:&mut Vec<Event>, normal:&mut Vec<crate::security_normalize::Normalized>,
         keys:&mut Vec<String>, memos:&mut Vec<Vec<Option<bool>>>) -> Result<(),String> {
         if events.is_empty(){return Ok(());}
         crate::security_budget::phase("predicate vectors");
         columnar.evaluate(&acc.population.db,events,memos)?;
-        for (((event,normalized),key),memo) in events.drain(..).zip(normal.drain(..)).zip(keys.drain(..)).zip(memos.drain(..)) {
+        crate::security_budget::phase("text signals");
+        let prepared: Vec<Prepared> = crate::global_scheduler::map(events.chunks(64), |chunk| {
+            chunk.iter().map(|ev| self.prepare(ev)).collect::<Vec<_>>()
+        }).into_iter().flatten().collect();
+        for ((((event,normalized),key),memo),prepared) in events.drain(..).zip(normal.drain(..)).zip(keys.drain(..)).zip(memos.drain(..)).zip(prepared) {
             acc.facts.select_key(key);acc.predicate_memo=memo;
             crate::security_budget::phase("normal facts and rule hits");
-            acc.population.observe(&event,&normalized)?;self.step(acc,&event,&normalized)?;
+            acc.population.observe(&event,&normalized)?;self.step(acc,&event,&normalized,prepared)?;
         }
         acc.columnar_batches=columnar.batches;acc.columnar_rows=columnar.rows;acc.columnar_reused_batches=columnar.reused_batches;acc.columnar_leaves=columnar.leaves();Ok(())
     }
@@ -1012,6 +1164,7 @@ impl Pass<'_> {
         acc: &mut Acc,
         ev: &Event,
         normalized: &crate::security_normalize::Normalized,
+        prepared: Prepared,
     ) -> Result<(), String> {
         use sha2::Digest;
         crate::security_budget::check()?;
@@ -1030,15 +1183,14 @@ impl Pass<'_> {
         }
         let ts = ev.timestamp.unwrap_or(i64::MIN);
         // Literal prefilter shared by every rule that declares required text.
-        if let Some(automaton) = &self.rules.automaton {
+        if let Some(found) = &prepared.literals {
             acc.stamp = acc.stamp.wrapping_add(1);
             if acc.stamp == 0 {
                 acc.stamps.iter_mut().for_each(|s| *s = 0);
                 acc.stamp = 1;
             }
-            let text = event_text(ev);
-            for found in automaton.find_overlapping_iter(&text) {
-                acc.stamps[found.pattern().as_usize()] = acc.stamp;
+            for &pattern in found {
+                acc.stamps[pattern as usize] = acc.stamp;
             }
         }
         for (index, rule) in self.rules.rules.iter().enumerate() {
@@ -1051,12 +1203,16 @@ impl Pass<'_> {
                 continue;
             }
             acc.applicable[index] += 1;
-            let absent: Vec<_> = policy
-                .required
-                .iter()
-                .filter(|f| ctx.get(&querylang::field_ref(f)).is_none_or(|v| v.is_empty()))
-                .cloned()
-                .collect();
+            let absent: Vec<_> = if policy.required.is_empty() {
+                Vec::new()
+            } else {
+                policy
+                    .required
+                    .iter()
+                    .filter(|f| ctx.get(&querylang::field_ref(f)).is_none_or(|v| v.is_empty()))
+                    .cloned()
+                    .collect()
+            };
             // An observed expected event that cannot be joined is not evidence
             // of absence. Fail closed for this rule, including missing namespaces.
             if rule.def.kind == "absence"
@@ -1082,6 +1238,26 @@ impl Pass<'_> {
                 }
             }
             acc.eligible[index] += 1;
+            if let Some(baseline) = &rule.baseline {
+                // Ordinary responses of the same group form the comparison baseline.
+                if baseline.matches_ctx(&ctx) {
+                    if let (Some(group), Some(value)) = (
+                        self.group_key(&ctx, &rule.by, true),
+                        rule.behavior_field.as_ref().and_then(|f| ctx.get(f)).and_then(|v| v.trim().parse::<u64>().ok()),
+                    ) {
+                        let key = serde_json::to_string(&(normalized.get("namespace").unwrap_or(""), group.as_ref())).map_err(|e| e.to_string())?;
+                        let slot = (index as u32, key.into_boxed_str());
+                        if let Some(histogram) = acc.baselines.get_mut(&slot) {
+                            histogram.add(value);
+                        } else if acc.baselines.len() < 200_000 && acc.stats_bytes.saturating_add(slot.1.len() + 96) <= 32 * 1024 * 1024 {
+                            acc.stats_bytes += slot.1.len() + 96;
+                            acc.baselines.entry(slot).or_default().add(value);
+                        } else {
+                            acc.limited = true;
+                        }
+                    }
+                }
+            }
             if !rule.contextual(ev) {
                 continue;
             }
@@ -1130,6 +1306,22 @@ impl Pass<'_> {
                             _ => break,
                         }
                     }
+                    "behavior" => {
+                        let field = |f: Option<&FieldRef>| f.and_then(|f| ctx.get(f)).map(|v| v.trim().chars().take(512).collect::<String>()).filter(|v| !v.is_empty());
+                        let value = if rule.def.behavior.as_ref().is_some_and(|b| b.model == "new_endpoint") {
+                            let Some(source) = field(rule.distinct.as_ref()) else { break };
+                            Some(format!("{source}\u{1f}{}", field(rule.behavior_method.as_ref()).unwrap_or_default().to_ascii_uppercase()))
+                        } else {
+                            field(rule.behavior_field.as_ref())
+                        };
+                        match value {
+                            Some(v) => Some(v.into_boxed_str()),
+                            None => {
+                                if let Some(name) = rule.def.behavior.as_ref().and_then(|b| b.field.clone()) { acc.missing[index].insert(name); }
+                                break;
+                            }
+                        }
+                    }
                     _ => None,
                 };
                 acc.hits += 1;
@@ -1157,7 +1349,7 @@ impl Pass<'_> {
                 };
                 if kind == "single" {
                     acc.groups.push(index as u32, &serde_json::to_string(&(&key, &ev.event_ref)).unwrap(), hit)?;
-                } else if kind == "absence" {
+                } else if kind == "absence" || kind == "behavior" {
                     acc.groups.push(
                         index as u32,
                         &serde_json::to_string(&(&key, Option::<i64>::None)).unwrap(),
@@ -1180,13 +1372,10 @@ impl Pass<'_> {
                 }
             }
         }
-        if let Some(catalog) =
-            self.catalog.filter(|_| ev.fields.get("_sec.literal_output").and_then(|v| v.as_str()) != Some("true"))
-        {
-            let (found, clipped) = catalog.event_hits_checked(ev);
+        if let (Some(catalog), Some(scan)) = (self.catalog, prepared.catalog) {
+            let crate::threats::Scan { hits: found, clipped, explained } = scan;
             acc.clipped += usize::from(clipped && !normalized.content_clipped);
             if !found.is_empty() {
-                let explained = found.iter().any(|&r| catalog.rule(r).id.starts_with("web.")).then(||catalog.explain(ev));
                 let key: Box<str> = [(Role::SrcIp, "@src_ip"), (Role::Host, "@host"), (Role::User, "@user")]
                     .iter()
                     .find_map(|(r, column)| ctx.role(*r).map(|v| serde_json::to_string(&[column, &v]).unwrap()))
@@ -1489,6 +1678,160 @@ struct Raw {
     extras: Vec<String>,
     metrics: serde_json::Value,
 }
+/// Dataset bounds and baselines the behavior models compare against.
+struct BehaviorContext<'a> {
+    first: Option<i64>,
+    last: Option<i64>,
+    baselines: &'a HashMap<(u32, Box<str>), Histogram>,
+}
+
+/// Matches of a `behavior` rule inside one group (ordered by time). Each match is
+/// a list of hit positions plus the measurements that justify it.
+fn behavior_matches(
+    rule: &Compiled,
+    index: u32,
+    key: &str,
+    len: usize,
+    get: &mut dyn FnMut(usize) -> Result<Hit, String>,
+    context: &BehaviorContext<'_>,
+) -> Result<Vec<(Vec<usize>, serde_json::Value)>, String> {
+    let Some(b) = rule.def.behavior.as_ref() else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    match b.model.as_str() {
+        "new_value" => {
+            // A value never seen before for this group, after an established history.
+            let minimum = b.min_history.unwrap_or(5);
+            let mut seen: std::collections::BTreeSet<String> = Default::default();
+            let mut history = 0usize;
+            for n in 0..len {
+                crate::operations::check()?;
+                let hit = get(n)?;
+                if hit.uncertain_time { continue; }
+                let Some(value) = hit.extra.as_deref().map(str::to_string) else { continue };
+                if history >= minimum && !seen.contains(&value) {
+                    out.push((vec![n], serde_json::json!({
+                        "model": "new_value", "value": value, "history": history,
+                        "previous_values": seen.iter().take(10).cloned().collect::<Vec<_>>(),
+                        "previous_value_count": seen.len(),
+                    })));
+                }
+                seen.insert(value);
+                history += 1;
+            }
+        }
+        "travel" => {
+            // Consecutive events from countries too far apart for the elapsed time.
+            let max_kmh = b.max_kmh.unwrap_or(1000.0);
+            let min_km = b.min_km.unwrap_or(500.0);
+            let mut previous: Option<(usize, i64, String)> = None;
+            for n in 0..len {
+                crate::operations::check()?;
+                let hit = get(n)?;
+                if hit.uncertain_time { continue; }
+                let Some(country) = hit.extra.as_deref().map(str::to_string) else { continue };
+                if let Some((p, ts, from)) = &previous {
+                    if !from.eq_ignore_ascii_case(&country) {
+                        if let Some(km) = crate::geoip::minimum_distance_km(from, &country) {
+                            let hours = (hit.ts - ts).max(0) as f64 / 3_600_000.0;
+                            let speed = if hours > 0.0 { km / hours } else { f64::INFINITY };
+                            if km >= min_km && speed > max_kmh {
+                                out.push((vec![*p, n], serde_json::json!({
+                                    "model": "travel", "from": from, "to": country,
+                                    "distance_km": km.round(), "minutes": (hours * 60.0).round(),
+                                    "speed_kmh": if speed.is_finite() { serde_json::json!(speed.round()) } else { serde_json::Value::Null },
+                                    "max_kmh": max_kmh,
+                                })));
+                            }
+                        }
+                    }
+                }
+                previous = Some((n, hit.ts, country));
+            }
+        }
+        "new_endpoint" => {
+            // A server-side script that appears late, used by very few sources, mostly by POST.
+            let max_sources = b.max_sources.unwrap_or(2);
+            let mut sources: std::collections::BTreeSet<String> = Default::default();
+            let (mut first, mut last, mut posts, mut count) = (None::<i64>, None::<i64>, 0usize, 0usize);
+            for n in 0..len {
+                crate::operations::check()?;
+                let hit = get(n)?;
+                let extra = hit.extra.as_deref().unwrap_or("");
+                let (source, method) = extra.split_once('\u{1f}').unwrap_or((extra, ""));
+                sources.insert(source.to_string());
+                if sources.len() > max_sources { return Ok(Vec::new()); }
+                if !hit.uncertain_time {
+                    first = min_opt(first, Some(hit.ts));
+                    last = max_opt(last, Some(hit.ts));
+                }
+                posts += usize::from(method == "POST" || method == "PUT");
+                count += 1;
+            }
+            let (Some(first), Some(start), Some(end)) = (first, context.first, context.last) else { return Ok(Vec::new()) };
+            let span = end - start;
+            let ratio = posts as f64 / count.max(1) as f64;
+            if count >= b.min_count.unwrap_or(3)
+                && span >= 3_600_000
+                && (first - start) as f64 >= b.late_fraction.unwrap_or(0.1) * span as f64
+                && ratio >= b.min_ratio.unwrap_or(0.5)
+            {
+                out.push(((0..len).collect(), serde_json::json!({
+                    "model": "new_endpoint", "first_seen": first, "last_seen": last,
+                    "dataset_start": start, "dataset_end": end,
+                    "requests": count, "post_ratio": (ratio * 100.0).round() / 100.0,
+                    "sources": sources.into_iter().collect::<Vec<_>>(),
+                })));
+            }
+        }
+        "appeared" => {
+            // The path answered only "not found" and then began to answer with success:
+            // a file created on the server, as when a webshell is planted.
+            let mut missing = Vec::new();
+            for n in 0..len {
+                crate::operations::check()?;
+                let hit = get(n)?;
+                match hit.extra.as_deref().and_then(|v| v.parse::<u16>().ok()) {
+                    Some(404 | 410) => missing.push(n),
+                    Some(200..=299) => {
+                        if missing.len() >= b.min_count.unwrap_or(1) {
+                            let first_missing = get(missing[0])?.ts;
+                            let mut members = missing.clone();
+                            members.push(n);
+                            out.push((members, serde_json::json!({
+                                "model": "appeared", "not_found": missing.len(),
+                                "first_not_found": first_missing, "first_success": hit.ts,
+                            })));
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "size_outlier" => {
+            let Some(histogram) = context.baselines.get(&(index, key.into())) else { return Ok(Vec::new()) };
+            let Some(median) = histogram.median_upper() else { return Ok(Vec::new()) };
+            if (histogram.samples as usize) < b.min_count.unwrap_or(20) { return Ok(Vec::new()); }
+            let factor = b.factor.unwrap_or(10.0);
+            let delta = b.min_delta.unwrap_or(4096.0);
+            for n in 0..len {
+                crate::operations::check()?;
+                let hit = get(n)?;
+                let Some(bytes) = hit.extra.as_deref().and_then(|v| v.parse::<u64>().ok()) else { continue };
+                let bytes = bytes as f64;
+                if bytes >= factor * median.max(1.0) && bytes - median >= delta {
+                    out.push((vec![n], serde_json::json!({
+                        "model": "size_outlier", "bytes": bytes, "baseline_median_bytes": median.round(),
+                        "baseline_samples": histogram.samples, "factor": factor,
+                    })));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
 fn raw_members(raw:&Raw,external:&crate::security_correlate::Store,mut visit:impl FnMut(usize,usize)->Result<(),String>)->Result<(),String>{if let Some(selection)=&raw.external{external.members(selection,visit)}else{for &id in &raw.members{visit(id,0)?;}Ok(())}}
 fn external_raws(store:&crate::security_correlate::Store,cache:&mut crate::security_checkpoints::Cache,inputs:&Inputs<'_>,acc:&Acc,dataset:&str,base:u32)->Result<crate::security_store::Spool<Raw>,String>{
     let mut raws=crate::security_store::Spool::new()?;
@@ -1499,6 +1842,16 @@ fn external_raws(store:&crate::security_correlate::Store,cache:&mut crate::secur
             let mut left=0;while left<group.len{let first=group.get(left)?;let mut right=left;let mut extras=Vec::new();while right<group.len && group.get(right)?.reference==first.reference{if let Some(extra)=group.get(right)?.extra{extras.push(extra.to_string());}right+=1;}extras.sort();extras.dedup();raws.push(Raw{rule:index,key:key.clone().into_boxed_str(),members:vec![first.id],external:None,distinct:0,period:None,extras,metrics:serde_json::Value::Null})?;left=right;}return Ok(());
         }
         let rule=&inputs.rules.rules[index as usize];
+        if rule.def.kind=="behavior" {
+            let context=BehaviorContext{first:acc.first,last:acc.last,baselines:&acc.baselines};
+            let mut get=|n:usize|group.get(n);
+            for (members,metrics) in behavior_matches(rule,index,&key,group.len,&mut get,&context)? {
+                let contiguous=members.windows(2).all(|w|w[1]==w[0]+1);
+                let selection=if contiguous{group.range(members[0],*members.last().unwrap())?}else{let selection=store.selection()?;for n in members{let hit=group.get(n)?;store.add(&selection,hit.id,hit.step as usize)?;}selection};
+                raws.push(Raw{rule:index,key:key.clone().into_boxed_str(),members:vec![],external:Some(selection),distinct:0,period:None,extras:vec![],metrics})?;
+            }
+            return Ok(());
+        }
         if rule.def.kind=="single" {for n in 0..group.len{raws.push(Raw{rule:index,key:key.clone().into_boxed_str(),members:vec![group.get(n)?.id],external:None,distinct:0,period:None,extras:vec![],metrics:serde_json::Value::Null})?;}return Ok(());}
         let context=if rule.def.kind=="absence"{serde_json::to_string(&(dataset,&inputs.settings.coverage)).map_err(|e|e.to_string())?}else{crate::analysis_runtime::fact_interpretation_signature()};
         let checkpoint_key=group.signature(&serde_json::to_string(&rule.def).map_err(|e|e.to_string())?,&format!("{key}:{partition:?}"),&context)?;
@@ -1701,7 +2054,7 @@ impl Source<'_> {
         acc.applicable.resize(pass.rules.rules.len(), 0);
         acc.missing.resize_with(pass.rules.rules.len(), HashSet::new);
         let mut columnar=pass.rules.plan.columnar(&acc.population.db)?;
-        let mut pending_events=Vec::new();let mut pending_normal=Vec::new();let mut pending_keys=Vec::new();let mut pending_memos=Vec::new();let mut pending_bytes=0usize;
+        let mut raw_batch:Vec<Event>=Vec::new();let mut raw_bytes=0usize;
         let mut seen = crate::security_store::Seen::default();
         let mut fragments = crate::security_reconstruct::Fragments::new()?;
         let reconstructed_members=crate::security_reconstruct::Members::new()?;
@@ -1714,26 +2067,36 @@ impl Source<'_> {
                 reported = std::time::Instant::now();
             }
         };
-        let mut consume =
-            |ev: &Event| -> Result<(), String> {
-                let (derived, normalized) = acc.facts.normalize(ev, pass.mappings)?;
-                if let Some(key) = &normalized.dedup_key {
+        // Events are interpreted in batches: normalization and the pure matching
+        // work run in parallel waves, while every step that accumulates state
+        // (deduplication, predicate checkpoints, rule hits) keeps the input order.
+        let mut flush = |batch: Vec<Event>, acc: &mut Acc| -> Result<(), String> {
+            if batch.is_empty() { return Ok(()); }
+            let mut events=Vec::with_capacity(batch.len());let mut normal=Vec::with_capacity(batch.len());let mut keys=Vec::with_capacity(batch.len());let mut memos=Vec::with_capacity(batch.len());
+            for (derived, normalized, key) in acc.facts.normalize_batch(batch, pass.mappings)? {
+                if let Some(dedup) = &normalized.dedup_key {
                     // Exact producer identity only; identical-looking messages may be distinct events.
-                    if !seen.insert(key.clone())? {
+                    if !seen.insert(dedup.clone())? {
                         acc.duplicates += 1;
-                        return Ok(());
+                        continue;
                     }
                 }
+                acc.facts.select_key(key.clone());
                 let mut memo=vec![None;pass.rules.plan.len()];
                 if let Some(signature)=&pass.rules.predicate_signature{acc.facts.restore_predicates(signature,&mut memo)?;}
-                pending_keys.push(acc.facts.content_key().to_string());pending_memos.push(memo);
-                pending_bytes+=derived.raw.len()+derived.message.len()+serde_json::to_vec(&derived.fields).map_err(|e|e.to_string())?.len()+serde_json::to_vec(&normalized).map_err(|e|e.to_string())?.len();
-                pending_events.push(derived);pending_normal.push(normalized);
-                if pending_events.len()>=1024 || pending_bytes>=8*1024*1024 {
-                    pass.flush_predicates(&mut acc,&mut columnar,&mut pending_events,&mut pending_normal,&mut pending_keys,&mut pending_memos)?;pending_bytes=0;
-                }
-                Ok(())
-            };
+                keys.push(key);memos.push(memo);events.push(derived);normal.push(normalized);
+            }
+            pass.flush_predicates(acc,&mut columnar,&mut events,&mut normal,&mut keys,&mut memos)
+        };
+        let mut consume = |ev: Event, acc: &mut Acc| -> Result<(), String> {
+            raw_bytes += approximate_bytes(&ev);
+            raw_batch.push(ev);
+            if raw_batch.len() >= BATCH_EVENTS || raw_bytes >= BATCH_BYTES {
+                raw_bytes = 0;
+                flush(std::mem::take(&mut raw_batch), acc)?;
+            }
+            Ok(())
+        };
         match self {
             Source::Selection(s) => {
                 for e in s.iter() {
@@ -1742,7 +2105,7 @@ impl Source<'_> {
                     if let Some(key) = crate::security_reconstruct::key(&e) {
                         fragments.push(&key, &e)?;
                     } else {
-                        consume(&e)?;
+                        consume(e, &mut acc)?;
                     }
                 }
             }
@@ -1753,16 +2116,17 @@ impl Source<'_> {
                     if let Some(key) = crate::security_reconstruct::key(e) {
                         fragments.push(&key, e)?;
                     } else {
-                        consume(e)?;
+                        consume((*e).clone(), &mut acc)?;
                     }
                 }
             }
         }
-        while let Some((event,_))=fragments.next(&reconstructed_members)? {consume(&event)?;}
+        while let Some((event,_))=fragments.next(&reconstructed_members)? {consume(event, &mut acc)?;}
         drop(consume);
         crate::operations::report_progress("comprometimentos", "triage-correlate", "Correlacionando os registros lidos", scanned, scanned, "registros", 0);
         acc.reconstructed=reconstructed_members;
-        pass.flush_predicates(&mut acc,&mut columnar,&mut pending_events,&mut pending_normal,&mut pending_keys,&mut pending_memos)?;
+        flush(std::mem::take(&mut raw_batch), &mut acc)?;
+        drop(flush);
         acc.facts.checkpoint()?;
         Ok(acc)
     }
@@ -1930,6 +2294,22 @@ fn run_inner(
                     push(vec![k], 0, None)?;
                 }
             }
+            "behavior" => {
+                let context = BehaviorContext { first: acc.first, last: acc.last, baselines: &acc.baselines };
+                let mut get = |n: usize| Ok(hits[n].clone());
+                for (members, metrics) in behavior_matches(rule, rule_index, &key, hits.len(), &mut get, &context)? {
+                    raws.push(Raw {
+                        rule: rule_index,
+                        key: key.clone(),
+                        members: members.iter().map(|&m| hits[m].id).collect(),
+                        external: None,
+                        distinct: 0,
+                        period: None,
+                        extras: Vec::new(),
+                        metrics,
+                    })?;
+                }
+            }
             "threshold" => {
                 for (i, j) in threshold_ranges(&hits, window, rule.counts[0]) {
                     push((i..=j).collect(), 0, None)?;
@@ -2001,7 +2381,8 @@ fn run_inner(
         let mut original_ids=crate::security_store::Spool::<(usize,Option<usize>)>::new()?;
         let mut reconstructed_ids=crate::security_store::Spool::<(usize,Option<usize>)>::new()?;
         let mut ids=Vec::new();let mut unique=crate::security_store::Seen::default();let mut full_count=0;
-        let mut add=|id:usize,step:Option<usize>|->Result<(),String>{if unique.insert(id.to_string())?{original_ids.push((id,step))?;reconstructed_ids.push((id,step))?;full_count+=1;if sink.is_none()||ids.len()<128{ids.push(id);}}Ok(())};
+        let mut step_counts=BTreeMap::<usize,usize>::new();
+        let mut add=|id:usize,step:Option<usize>|->Result<(),String>{if unique.insert(id.to_string())?{original_ids.push((id,step))?;reconstructed_ids.push((id,step))?;full_count+=1;if let Some(step)=step{*step_counts.entry(step).or_insert(0)+=1;}if sink.is_none()||ids.len()<128{ids.push(id);}}Ok(())};
         if let Some(selection)=&raw.external{external.members(selection,|id,step|add(id,Some(step)))?;}else{for id in raw.members{add(id,None)?;}}
         if ids.is_empty(){continue;}
         let (name, description, severity, attack_refs, kind, origin, by_columns, rule_id): (
@@ -2398,6 +2779,12 @@ fn run_inner(
         if hidden { suppressed += 1; if let Some(writer)=sink.as_ref(){writer.discard_staged()?;}continue; }
         let template = rule.and_then(|r| r.def.summary.as_deref());
         detection.summary = render_summary(template, detection, first.as_ref());
+        // One factual sentence for correlations, which have no single excerpt to show.
+        if let Some(sentence) = narrate(rule, detection, &step_counts) {
+            if !detection.measurements.is_object() { detection.measurements = serde_json::json!({}); }
+            detection.measurements["narrative"] = serde_json::Value::from(sentence);
+            if step_counts.len() > 1 { detection.measurements["step_counts"] = serde_json::json!(step_counts); }
+        }
         detection.pattern_source = first.as_ref().map(crate::security_grouping::source);
         // Exact evidence selection, independent of mutable rule definitions and time filters.
         detection.filters = vec![crate::query::Filter {
@@ -2540,6 +2927,133 @@ fn run_inner(
         limitations,
         duplicates: acc.duplicates,
     })
+}
+
+/// Plural noun used in the sentences: "38 falhas", "1 sucesso".
+fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
+}
+
+fn field_noun(field: &str) -> &str {
+    match field {
+        "@src_ip" | "source.ip" | "src_ip" => "IPs",
+        "@dst_ip" | "destination.ip" => "destinos",
+        "@user" | "_sec.identity" | "_sec.principal" => "contas",
+        "@host" | "_sec.host" => "hosts",
+        "@dst_port" | "destination.port" => "portas",
+        "ua.family" | "@user_agent" => "clientes",
+        "_sec.geo.country" => "países",
+        "@url" | "_sec.url.path" | "url" => "endereços",
+        "@process" | "@cmdline" | "_sec.command" => "comandos",
+        other => other,
+    }
+}
+
+/// Noun of a sequence step: its declared label, or what its condition selects.
+fn step_noun(rule: &Compiled, step: usize, n: usize) -> String {
+    let def = &rule.def.steps[step];
+    if let Some(label) = def.label.as_deref().filter(|l| !l.trim().is_empty()) {
+        return format!("{label} ({n})");
+    }
+    let condition = def.condition.to_ascii_lowercase();
+    if condition.contains("_sec.outcome:failure") {
+        counted(n, "falha", "falhas")
+    } else if condition.contains("_sec.outcome:success") {
+        counted(n, "sucesso", "sucessos")
+    } else {
+        format!("etapa {} ({n})", step + 1)
+    }
+}
+
+/// A sentence with the measured facts of a finding: counts, steps, distances.
+fn narrate(rule: Option<&Compiled>, d: &Detection, steps: &BTreeMap<usize, usize>) -> Option<String> {
+    let rule = rule?;
+    // Who acted, in readable words: the origin and the account, not composite keys.
+    let entity = |column: &str| d.entities.iter().find(|e| e.column == column).map(|e| e.value.as_str());
+    let mut actors = Vec::new();
+    if let Some(ip) = entity("@src_ip") { actors.push(format!("origem {ip}")); }
+    if let Some(user) = entity("@user") { actors.push(format!("conta {user}")); }
+    if actors.is_empty() {
+        if let Some(e) = d.entities.iter().find(|e| !e.value.starts_with('[') && !e.value.starts_with('{')) {
+            actors.push(e.value.clone());
+        }
+    }
+    let who = if actors.is_empty() { String::new() } else { format!(" ({})", actors.join(", ")) };
+    let within = match (d.start, d.end) {
+        (Some(a), Some(b)) if b > a => format!(" em {}", format_period(b - a)),
+        _ => String::new(),
+    };
+    let m = &d.measurements;
+    let number = |key: &str| m[key].as_f64();
+    let sentence = match rule.def.kind.as_str() {
+        "threshold" => format!("{}{within}{who}", counted(d.count, "registro", "registros")),
+        "distinct" => {
+            let noun = rule.def.distinct.as_deref().map(field_noun).unwrap_or("valores");
+            format!("{} {noun} diferentes{within}{who}, em {}", d.distinct, counted(d.count, "registro", "registros"))
+        }
+        "sequence" | "temporal" if !rule.def.steps.is_empty() && !steps.is_empty() => {
+            let parts: Vec<String> = (0..rule.def.steps.len())
+                .filter(|i| steps.contains_key(i))
+                .map(|i| step_noun(rule, i, steps[&i]))
+                .collect();
+            format!("{}{within}{who}", parts.join(" → "))
+        }
+        "beacon" => format!(
+            "{} a intervalos de {}{who}",
+            counted(d.count, "conexão", "conexões"),
+            d.period_ms.map(format_period).unwrap_or_else(|| "—".into())
+        ),
+        "ratio" => format!(
+            "{} de {} registros atendem à condição ({}%){within}{who}",
+            number("numerator")? as usize,
+            number("denominator")? as usize,
+            (number("ratio")? * 100.0).round()
+        ),
+        "aggregate" => format!(
+            "{} de {} = {} em {}{within}{who}",
+            m["operation"].as_str()?,
+            m["field"].as_str()?,
+            number("value")?,
+            counted(number("samples")? as usize, "registro", "registros")
+        ),
+        "behavior" => match m["model"].as_str()? {
+            "new_value" => format!(
+                "Primeira vez a partir de {} depois de {} (antes: {})",
+                m["value"].as_str()?,
+                counted(number("history")? as usize, "acesso", "acessos"),
+                m["previous_values"].as_array()?.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+            "travel" => format!(
+                "{} → {}: pelo menos {} km em {} min{}",
+                m["from"].as_str()?,
+                m["to"].as_str()?,
+                number("distance_km")?,
+                number("minutes")?,
+                number("speed_kmh").map(|v| format!(" ({v} km/h)")).unwrap_or_else(|| " (mesmo horário)".into())
+            ),
+            "appeared" => format!(
+                "{} antes do primeiro sucesso, {} depois da primeira",
+                counted(number("not_found")? as usize, "resposta 404", "respostas 404"),
+                format_period((number("first_success")? - number("first_not_found")?) as i64)
+            ),
+            "new_endpoint" => format!(
+                "Surgiu {} após o início do período; {} de {}, {}% POST",
+                format_period((number("first_seen")? - number("dataset_start")?) as i64),
+                counted(number("requests")? as usize, "requisição", "requisições"),
+                m["sources"].as_array()?.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" e "),
+                (number("post_ratio")? * 100.0).round()
+            ),
+            "size_outlier" => format!(
+                "Resposta de {} bytes; o normal deste endereço é cerca de {} bytes ({} respostas comuns)",
+                number("bytes")?,
+                number("baseline_median_bytes")?,
+                number("baseline_samples")?
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(sentence)
 }
 
 fn render_summary(template: Option<&str>, detection: &Detection, first: Option<&Event>) -> String {

@@ -142,7 +142,7 @@ window.WorkspaceContext = (() => {
         for (const [selector, [left, top]] of Object.entries(snapshot.scroll || {})) { const node = document.querySelector(selector); if (node) { node.scrollLeft = left; node.scrollTop = top; } }
       });
     };
-    const animate = options.animate !== false && !matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const animate = options.animate !== false && !(window.AnalysisPreferences?.reducedMotion?.() ?? matchMedia("(prefers-reduced-motion: reduce)").matches);
     // Zones are stacked in the menu: moving down the list slides the new area up from below.
     const order = { analysis: 0, case: 1, structure: 2 }, from = document.documentElement.dataset.zone || "analysis";
     const to = next === "case" ? "case" : ["sources", "connections", "import"].includes(page) ? "structure" : "analysis";

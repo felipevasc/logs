@@ -1,0 +1,376 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "web.attack.server-error",
+      "name": "Payload de ataque provocou erro no servidor",
+      "description": "Uma requisição com payload de ataque (injeção SQL, XSS, traversal, leitura de arquivo, XXE, comando) recebeu resposta 5xx. O erro mostra que o conteúdo chegou ao processamento da aplicação em vez de ser rejeitado na entrada.",
+      "severity": "high",
+      "attack": ["T1190"],
+      "kind": "single",
+      "where": "_sec.web.attack:true _sec.http.status_class:5xx",
+      "summary": "{_sec.http.method} {_sec.url.path} com payload → HTTP {_sec.http.status}",
+      "evidence": {
+        "level": 4,
+        "claim": "attempt",
+        "rationale": "O payload foi registrado na requisição e a aplicação respondeu com erro interno, sinal de que o conteúdo foi processado e de que a entrada não é validada antes de chegar ao código.",
+        "missing": [
+          "Mensagem de erro da aplicação ou do banco no mesmo horário.",
+          "Resultado de requisições seguintes da mesma origem."
+        ],
+        "benign": [
+          "Scanner autorizado ou aplicação frágil que falha com qualquer entrada inesperada."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1190/"]
+    },
+    {
+      "id": "web.attack.size-outlier",
+      "name": "Resposta muito maior que o normal para requisição com payload",
+      "description": "Uma requisição com payload de ataque recebeu resposta de sucesso muito maior que as respostas habituais do mesmo endereço. Dumps de banco por injeção SQL, leitura de arquivos e listagens indevidas aparecem assim nos logs de acesso.",
+      "severity": "high",
+      "attack": ["T1190", "T1005"],
+      "kind": "behavior",
+      "where": "_sec.web.attack:true _sec.http.status_class:2xx",
+      "by": ["_sec.url.path"],
+      "behavior": {
+        "model": "size_outlier",
+        "field": "_sec.http.bytes",
+        "baseline": "_sec.http.status_class:2xx _sec.http.bytes:* -_sec.web.attack:true",
+        "min_count": 20,
+        "factor": 10,
+        "min_delta": 4096
+      },
+      "summary": "{_sec.http.method} {_sec.url.path} com payload devolveu {_sec.http.bytes} bytes",
+      "evidence": {
+        "level": 4,
+        "claim": "effect",
+        "rationale": "A resposta à requisição com payload tem tamanho pelo menos dez vezes o tamanho mediano das respostas comuns do mesmo endereço, medido no próprio conjunto: o ataque provavelmente devolveu dados.",
+        "missing": [
+          "Conteúdo da resposta; o log de acesso registra só o tamanho.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Endereço que devolve relatórios ou arquivos de tamanho variável conforme os parâmetros."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1190/"]
+    },
+    {
+      "id": "web.script-appeared",
+      "name": "Script que não existia passou a responder",
+      "description": "Um script do servidor (PHP, JSP, ASP...) respondia 404 e, depois, passou a responder com sucesso. Um arquivo executável foi criado no servidor nesse intervalo, como acontece quando um webshell é implantado.",
+      "severity": "high",
+      "attack": ["T1505.003"],
+      "kind": "behavior",
+      "where": "_sec.web.script:true _sec.http.status:*",
+      "by": ["_sec.url.path"],
+      "behavior": {
+        "model": "appeared",
+        "field": "_sec.http.status",
+        "min_count": 1
+      },
+      "summary": "{_sec.url.path} passou de 404 a {_sec.http.status}",
+      "evidence": {
+        "level": 3,
+        "claim": "activity",
+        "rationale": "O mesmo caminho de script respondeu que não existia e depois respondeu com sucesso: o arquivo foi criado entre os dois registros.",
+        "missing": [
+          "Quem criou o arquivo e por qual meio (upload, deploy, editor).",
+          "Conteúdo do arquivo no servidor."
+        ],
+        "benign": [
+          "Publicação de uma nova versão da aplicação ou rota criada por um deploy."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1505/003/"]
+    },
+    {
+      "id": "webshell.upload-dir-script",
+      "name": "Script executado em pasta de upload",
+      "description": "Um script do servidor dentro de uma pasta de upload ou de conteúdo estático (uploads, images, media, tmp...) respondeu com sucesso. Essas pastas guardam arquivos enviados e não deveriam executar código.",
+      "severity": "high",
+      "attack": ["T1505.003"],
+      "kind": "single",
+      "where": "_sec.web.script:true _sec.web.upload_dir:true _sec.http.status_class:2xx",
+      "summary": "{_sec.http.method} {_sec.url.path} → HTTP {_sec.http.status}",
+      "evidence": {
+        "level": 3,
+        "claim": "activity",
+        "rationale": "Um arquivo com extensão de script foi servido com sucesso a partir de uma pasta destinada a uploads ou a conteúdo estático, padrão típico de webshell enviado por formulário de upload.",
+        "missing": [
+          "Se o servidor executou o script ou apenas devolveu o arquivo.",
+          "Upload correspondente e autor."
+        ],
+        "benign": [
+          "Aplicação que mantém scripts legítimos em pastas com esses nomes."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1505/003/"]
+    },
+    {
+      "id": "webshell.new-script",
+      "name": "Script novo usado por poucas origens via POST",
+      "description": "Um script do servidor que só aparece depois do início do período, é acessado por no máximo duas origens e recebe principalmente POST. É o perfil de uso de um webshell: um arquivo novo, usado só pelo atacante, enviando comandos.",
+      "severity": "high",
+      "attack": ["T1505.003"],
+      "kind": "behavior",
+      "where": "_sec.web.script:true _sec.http.status_class:2xx",
+      "by": ["_sec.url.path"],
+      "distinct": "@src_ip",
+      "behavior": {
+        "model": "new_endpoint",
+        "method_field": "_sec.http.method",
+        "max_sources": 2,
+        "min_count": 3,
+        "min_ratio": 0.5,
+        "late_fraction": 0.1
+      },
+      "summary": "{_sec.url.path} usado por {@src_ip}",
+      "evidence": {
+        "level": 3,
+        "claim": "activity",
+        "rationale": "O caminho não aparece no início do período, todo o seu uso vem de no máximo duas origens e a maioria das requisições é POST, combinação rara em páginas legítimas.",
+        "missing": [
+          "Conteúdo do script e parâmetros enviados.",
+          "Origem do arquivo (upload, deploy)."
+        ],
+        "benign": [
+          "Ferramenta administrativa nova usada por poucas pessoas, ou endpoint de integração entre sistemas."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1505/003/"]
+    },
+    {
+      "id": "webshell.upload-then-script",
+      "name": "Upload seguido de acesso a script em pasta de upload",
+      "description": "A mesma origem enviou um arquivo (POST ou PUT para um endereço de upload) e, logo depois, acessou com sucesso um script dentro de uma pasta de upload.",
+      "severity": "critical",
+      "attack": ["T1505.003", "T1105"],
+      "kind": "sequence",
+      "by": ["@src_ip"],
+      "window": "30m",
+      "steps": [
+        {
+          "where": "_sec.http.method:(POST OR PUT) _sec.http.status_class:2xx _sec.url.path:/(?i)(upload|attach|import|media|avatar|file|image)/",
+          "label": "envio de arquivo"
+        },
+        {
+          "where": "_sec.web.script:true _sec.web.upload_dir:true _sec.http.status_class:2xx",
+          "label": "acesso ao script"
+        }
+      ],
+      "summary": "{@src_ip} enviou um arquivo e acessou {_sec.url.path}",
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "O envio e o acesso ao script na pasta de upload vêm da mesma origem, em ordem e dentro de 30 minutos.",
+        "missing": [
+          "Nome do arquivo enviado; o log de acesso não registra o corpo do upload.",
+          "Conteúdo do script no servidor."
+        ],
+        "benign": [
+          "Sistema que gera scripts em pastas de upload por desenho, ou testes autorizados."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1505/003/"]
+    },
+    {
+      "id": "session.multi-browser",
+      "name": "Mesma sessão usada por navegadores diferentes",
+      "description": "Um mesmo identificador de sessão web apareceu com famílias de cliente diferentes (por exemplo Chrome e curl) em pouco tempo. Um token roubado e reutilizado por outra ferramenta aparece assim.",
+      "severity": "high",
+      "attack": ["T1550.004", "T1539"],
+      "kind": "distinct",
+      "where": "_sec.web.session:* ua.family:*",
+      "by": ["_sec.web.session"],
+      "distinct": "ua.family",
+      "window": "1h",
+      "count": 2,
+      "summary": "Sessão usada por {distinct} clientes diferentes",
+      "evidence": {
+        "level": 3,
+        "claim": "activity",
+        "rationale": "Um navegador mantém o mesmo user agent durante a sessão; famílias diferentes com o mesmo token indicam que outra ferramenta recebeu o token.",
+        "missing": [
+          "Origem de cada uso e ações feitas com a sessão.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Aplicativo que compartilha a sessão entre o navegador embutido e o cliente HTTP do próprio aplicativo."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1550/004/"]
+    },
+    {
+      "id": "session.multi-country",
+      "name": "Mesma sessão usada a partir de países diferentes",
+      "description": "Um mesmo identificador de sessão web apareceu com endereços de países diferentes em pouco tempo. Requer a base de países instalada.",
+      "severity": "high",
+      "attack": ["T1550.004", "T1539"],
+      "kind": "distinct",
+      "where": "_sec.web.session:* _sec.geo.country:*",
+      "by": ["_sec.web.session"],
+      "distinct": "_sec.geo.country",
+      "window": "1h",
+      "count": 2,
+      "summary": "Sessão usada a partir de {distinct} países",
+      "evidence": {
+        "level": 3,
+        "claim": "activity",
+        "rationale": "A mesma sessão em países diferentes dentro de uma hora não é compatível com um único usuário, salvo VPN ou proxy.",
+        "missing": [
+          "Uso de VPN, proxy corporativo ou rede móvel em roaming."
+        ],
+        "benign": [
+          "VPN ou proxy que alterna a saída entre países."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1550/004/"]
+    },
+    {
+      "id": "session.multi-ip",
+      "name": "Mesma sessão usada por vários endereços",
+      "description": "Um mesmo identificador de sessão web apareceu com três ou mais endereços de origem em 30 minutos.",
+      "severity": "medium",
+      "attack": ["T1550.004"],
+      "kind": "distinct",
+      "where": "_sec.web.session:* @src_ip:*",
+      "by": ["_sec.web.session"],
+      "distinct": "@src_ip",
+      "window": "30m",
+      "count": 3,
+      "summary": "Sessão usada por {distinct} endereços",
+      "evidence": {
+        "level": 2,
+        "claim": "activity",
+        "rationale": "Vários endereços para a mesma sessão em pouco tempo podem indicar reuso do token por terceiros.",
+        "missing": [
+          "País, rede e cliente de cada endereço."
+        ],
+        "benign": [
+          "Redes móveis, IPv4 e IPv6 do mesmo aparelho, balanceadores e proxies corporativos."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1550/004/"]
+    },
+    {
+      "id": "geo.new-country",
+      "name": "Login de país inédito para a conta",
+      "description": "Login bem-sucedido de uma conta a partir de um país que ela não tinha usado antes no conjunto, depois de um histórico de pelo menos cinco logins. Requer a base de países instalada.",
+      "severity": "medium",
+      "attack": ["T1078"],
+      "kind": "behavior",
+      "where": "_sec.action:logon _sec.outcome:success _sec.geo.country:*",
+      "by": ["_sec.identity"],
+      "behavior": {
+        "model": "new_value",
+        "field": "_sec.geo.country",
+        "min_history": 5
+      },
+      "summary": "{@user} entrou a partir de {_sec.geo.country}",
+      "evidence": {
+        "level": 2,
+        "claim": "activity",
+        "rationale": "O país do endereço de origem nunca tinha aparecido nos logins anteriores da conta neste conjunto.",
+        "missing": [
+          "Viagem, VPN ou acesso autorizado do titular.",
+          "Ações feitas depois do login."
+        ],
+        "benign": [
+          "Viagem, VPN, roaming ou base de países desatualizada."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1078/"]
+    },
+    {
+      "id": "geo.impossible-travel",
+      "name": "Viagem impossível entre logins",
+      "description": "Dois logins bem-sucedidos da mesma conta, em países tão distantes que o intervalo entre eles exigiria mais de 1.000 km/h. Requer a base de países instalada.",
+      "severity": "high",
+      "attack": ["T1078"],
+      "kind": "behavior",
+      "where": "_sec.action:logon _sec.outcome:success _sec.geo.country:*",
+      "by": ["_sec.identity"],
+      "behavior": {
+        "model": "travel",
+        "field": "_sec.geo.country",
+        "max_kmh": 1000,
+        "min_km": 500
+      },
+      "summary": "{@user}: logins em países distantes em pouco tempo",
+      "evidence": {
+        "level": 3,
+        "claim": "activity",
+        "rationale": "A distância mínima entre os países (descontada a extensão do território) dividida pelo intervalo entre os logins supera a velocidade de um avião.",
+        "missing": [
+          "Uso de VPN ou proxy em um dos logins.",
+          "Ações feitas por cada sessão."
+        ],
+        "benign": [
+          "VPN, proxy em nuvem ou serviço que autentica em nome do usuário."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1078/"]
+    },
+    {
+      "id": "geo.hosting-login",
+      "name": "Login a partir de datacenter ou nuvem",
+      "description": "Login bem-sucedido cujo endereço de origem pertence a um provedor de hospedagem, VPS ou nuvem, e não a uma rede de acesso de usuários. Requer a base de ASN instalada.",
+      "severity": "medium",
+      "attack": ["T1078"],
+      "kind": "single",
+      "where": "_sec.action:logon _sec.outcome:success _sec.geo.hosting:true",
+      "summary": "{@user} entrou a partir de {_sec.geo.as_org}",
+      "evidence": {
+        "level": 2,
+        "claim": "activity",
+        "rationale": "Pessoas costumam acessar a partir de redes residenciais, móveis ou corporativas; atacantes usam VPS e servidores em nuvem para operar.",
+        "missing": [
+          "Se a conta é de serviço ou de automação que roda na nuvem.",
+          "Ações feitas depois do login."
+        ],
+        "benign": [
+          "Bastion, VPN corporativa ou automação hospedada em nuvem."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": ["https://attack.mitre.org/techniques/T1078/"]
+    }
+  ]
+}

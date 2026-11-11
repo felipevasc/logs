@@ -3500,7 +3500,7 @@ window.WaitingVisuals = (() => {
     }
     function syncMotion() {
       if (destroyed || !current) return;
-      const reduced = !!media?.matches;
+      const reduced = !!media?.matches || !!view.AnalysisPreferences?.lowPower?.();
       const next = current.live && motionEnabled && !reduced && visible && intersecting && !document.hidden && root.isConnected;
       root.dataset.motion = next ? 'running' : 'static';
       // Reduced motion (or a host-disabled animation) in an empty room shows a still robot.
@@ -3540,6 +3540,7 @@ window.WaitingVisuals = (() => {
     document.addEventListener('visibilitychange', syncMotion);
     if (media?.addEventListener) media.addEventListener('change', syncMotion);
     else if (media?.addListener) media.addListener(syncMotion);
+    view.document?.addEventListener?.('loginsight:motion-change', syncMotion);
     // No IntersectionObserver means static, not an unbounded offscreen loop.
     const observer = typeof view.IntersectionObserver === 'function' ? new view.IntersectionObserver(entries => {
       if (destroyed) return;
@@ -3557,6 +3558,7 @@ window.WaitingVisuals = (() => {
       document.removeEventListener('visibilitychange', syncMotion);
       if (media?.removeEventListener) media.removeEventListener('change', syncMotion);
       else if (media?.removeListener) media.removeListener(syncMotion);
+      view.document?.removeEventListener?.('loginsight:motion-change', syncMotion);
       root.remove();
     }
     // Results settle immediately: the host closes and the room goes with it.

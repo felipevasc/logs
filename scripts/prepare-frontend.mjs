@@ -22,7 +22,7 @@ for (const item of [
   "case-evidence-transfer.js", "case-evidence-recovery.js", "resource-settings.js", "resource-settings.css",
   "resources.js", "resources.css", "value-inspector.js",
   "field-indexes.js",
-  "compromise-progress.js",
+  "compromise-progress.js", "lazy-modules.js", "analysis-preferences.js",
   "log-split.js", "log-split.css",
   "local-native.js", "local-explorer.js", "local-explorer.css", "file-viewer.js",
   "regex-syntax.js", "regex-editor.js", "regex-editor.css", "regex-assist.js", "regex-workbench.js",

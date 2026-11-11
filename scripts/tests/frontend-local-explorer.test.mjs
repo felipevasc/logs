@@ -109,8 +109,12 @@ test("expression drafts are bounded and only accept known engines", () => {
 test("every new script is bundled and loaded by the page", () => {
   const html = readFileSync(new URL("../../frontend/index.html", import.meta.url), "utf8");
   const prepare = readFileSync(new URL("../prepare-frontend.mjs", import.meta.url), "utf8");
+  // The Extraction page loads its scripts on first open, in this order.
+  const lazy = readFileSync(new URL("../../frontend/lazy-modules.js", import.meta.url), "utf8");
+  assert.match(lazy, /extraction: \["extraction-model\.js", "columns-engine\.js", "columns\.js", "extraction\.js"\]/);
+  assert.ok(html.includes('src="lazy-modules.js"') && prepare.includes('"lazy-modules.js"'));
   for (const file of ["local-native.js", "local-explorer.js", "file-viewer.js", "regex-syntax.js", "regex-editor.js", "regex-assist.js", "regex-workbench.js", "event-context.js", "event-pattern-search.js", "field-extraction.js", "extraction-model.js", "columns-engine.js", "columns.js", "extraction.js"]) {
-    assert.ok(html.includes(`src="${file}"`), file);
+    assert.ok(html.includes(`src="${file}"`) || lazy.includes(`"${file}"`), file);
     assert.ok(prepare.includes(`"${file}"`), file);
   }
   for (const file of ["regex-editor.css", "local-explorer.css", "columns.css"]) assert.ok(html.includes(`href="${file}"`) && prepare.includes(`"${file}"`), file);

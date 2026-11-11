@@ -1321,6 +1321,8 @@ async function loadData(requestedSource = null, options = {}) {
       loadedAt: Date.now(),
       source,
     };
+    // Optional listeners (automatic compromise calculation) must never affect the load itself.
+    try { document.dispatchEvent(new CustomEvent("loginsight:source-loaded", { detail: { count: summary.count, artifact: state.currentArtifact.id } })); } catch { /* optional */ }
     const restoredVisiblePreferences = restoreVisiblePreferences();
     const artifactSaved = storeCurrentArtifactInSession();
     if (source.kind === "file") {
@@ -7387,6 +7389,7 @@ async function openSettings(tab = "interface") {
   if (tab === "codes") await renderCodesPane();
   if (tab === "mcp") await renderMcpPane();
   if (tab === "detection") await window.Security?.renderRulesPane($("#settings-pane-detection"));
+  if (tab === "analysis") window.AnalysisPreferences?.renderPane($("#settings-pane-analysis"));
   if (tab === "recovery" && nativeEvidenceEnabled()) await window.CaseEvidenceRecovery?.renderPane($("#settings-pane-recovery"));
   if (tab === "updates") await window.Updates?.renderPane($("#settings-pane-updates"));
   if (tab === "resources") await window.ResourceSettings?.renderPane($("#settings-pane-resources"));

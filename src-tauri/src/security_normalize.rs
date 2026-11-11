@@ -1151,7 +1151,28 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
             .insert("_sec.literal_output".into(), Value::from("true"));
     }
     crate::security_content::apply(ev, &mut derived, &mut n);
+    crate::security_http::annotate(ev, &mut derived, &n);
+    annotate_location(ev, &mut derived);
     (derived, n)
+}
+
+/// Country, autonomous system and hosting class of the source address, from the
+/// offline base the user installed. Without a base nothing is added.
+fn annotate_location(ev: &Event, derived: &mut Event) {
+    let Some(ip) = entities::value(ev, Role::SrcIp) else { return };
+    let Some(found) = crate::geoip::locate(&ip) else { return };
+    if let Some(country) = found.country {
+        derived.fields.insert("_sec.geo.country".into(), Value::from(country));
+    }
+    if let Some(asn) = found.asn {
+        derived.fields.insert("_sec.geo.asn".into(), Value::from(format!("AS{asn}")));
+    }
+    if let Some(org) = found.org {
+        derived.fields.insert("_sec.geo.as_org".into(), Value::from(org));
+    }
+    if found.hosting {
+        derived.fields.insert("_sec.geo.hosting".into(), Value::from("true"));
+    }
 }
 
 /// Bounded text transformation; never evaluates the decoded payload.

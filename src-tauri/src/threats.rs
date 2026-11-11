@@ -240,6 +240,12 @@ pub(crate) fn attack_for(rule: &Rule) -> Vec<String> {
     crate::attack::for_threat_category(&rule.category).iter().map(|s| s.to_string()).collect()
 }
 
+pub(crate) struct Scan {
+    pub hits: Vec<usize>,
+    pub clipped: bool,
+    pub explained: Option<Vec<Hit>>,
+}
+
 pub(crate) struct Hit {
     pub rule: usize,
     pub snippet: String,
@@ -272,10 +278,24 @@ impl CompiledCatalog {
         let body = corpus(event);
         (body.hits(self), body.clipped)
     }
+    /// Hits, clipping and (for web signals) their explanation from one corpus.
+    pub(crate) fn scan(&self, event: &Event) -> Scan {
+        let body = corpus(event);
+        let hits = body.hits(self);
+        let explained = hits
+            .iter()
+            .any(|&r| self.rule(r).id.starts_with("web."))
+            .then(|| self.explain_corpus(event, &body, hits.clone()));
+        Scan { hits, clipped: body.clipped, explained }
+    }
     /// Matches never cross field boundaries or a decoded/original boundary.
     pub(crate) fn explain(&self, event: &Event) -> Vec<Hit> {
         let body = corpus(event);
-        body.hits(self)
+        let hits = body.hits(self);
+        self.explain_corpus(event, &body, hits)
+    }
+    fn explain_corpus(&self, event: &Event, body: &Corpus, hits: Vec<usize>) -> Vec<Hit> {
+        hits
             .into_iter()
             .filter_map(|rule| {
                 let (start, end, normalized) = body.find(&self.regexes[rule])?;

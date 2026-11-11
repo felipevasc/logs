@@ -782,6 +782,7 @@ pub fn convert(doc: &Value) -> Result<Compiled, String> {
         aggregate: None,
         coverage: None,
         bindings: Vec::new(),
+        behavior: None,
         references: doc["references"]
             .as_array()
             .into_iter()

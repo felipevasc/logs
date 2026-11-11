@@ -64,6 +64,8 @@ mod security_duck_stream;
 mod security_grouping;
 mod security_themes;
 mod client_inventory;
+mod geoip;
+mod security_http;
 mod security_participants;
 #[cfg(test)]
 mod security_participants_tests;
@@ -2438,6 +2440,10 @@ pub fn run() {
             explore_snapshot,
             aggregate_events,
             client_inventory,
+            geoip::geoip_status,
+            geoip::geoip_import,
+            geoip::geoip_download,
+            geoip::geoip_remove,
             trail_events,
             count_filtered,
             tree_aggs,
@@ -2530,3 +2536,5 @@ pub fn run() {
 
 #[cfg(test)]
 mod security_tests;
+#[cfg(test)]
+mod security_behavior_tests;

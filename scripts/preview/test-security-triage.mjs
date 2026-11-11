@@ -17,8 +17,10 @@ try {
   await page.evaluate(() => Workspace.showPage("compromises"));
   await page.evaluate(() => Security.get());
   await page.waitForSelector(".evidence-control");
-  assert.equal(await page.evaluate(() => Security.minimum()), 5);
-  assert.equal(await page.locator(".sec-episode").count(), 0);
+  // Without an explicit choice the page opens at the highest level that has findings.
+  const highest = await page.evaluate(() => { const c = Security.cached().counts_by_level; for (let n = 5; n >= 1; n--) if (c[n - 1]) return n; return 5; });
+  await page.waitForFunction(level => Security.minimum() === level, highest);
+  await page.waitForSelector(".sec-episode");
   await page.locator("[data-evidence-min='2']").click();
   await page.waitForSelector(".sec-episode");
   const episode = await page.evaluate(() => ({ title: document.querySelector(".sec-episode h3")?.textContent, markers: document.querySelectorAll(".sec-markers .sec-marker, .sec-markers button").length }));

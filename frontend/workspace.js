@@ -28,7 +28,7 @@
     document.querySelectorAll(".nav-pages [data-zones]").forEach(b => { b.hidden = !b.dataset.zones.split(" ").includes(zone); });
     document.querySelectorAll(".zone-switch [data-zone]").forEach(b => { const on = b.dataset.zone === zone; b.classList.toggle("selected", on); b.setAttribute("aria-pressed", String(on)); });
     // Moving between areas without changing the data slides the new area in, down or up the menu.
-    if (previous && previous !== zone && !window.WorkspaceContext?.changing && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    if (previous && previous !== zone && !window.WorkspaceContext?.changing && !(window.AnalysisPreferences?.reducedMotion?.() ?? matchMedia("(prefers-reduced-motion: reduce)").matches)) {
       const down = ZONE_ORDER[zone] > ZONE_ORDER[previous];
       requestAnimationFrame(() => [...document.querySelectorAll("#workspace-home,.shell,#view-analysis,#view-artifact-source")].find(n => !n.hidden)?.animate([{ transform: `translateY(${down ? "32%" : "-32%"})`, opacity: .3 }, { transform: "translateY(0)", opacity: 1 }], { duration: 260, easing: "cubic-bezier(.2,.7,.2,1)" }));
     }
@@ -130,11 +130,11 @@
     }
     switchView("workspace"); home.hidden = false;
     if (next === "file-viewer") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; window.FileViewer?.mount(content); return; }
-    if (next === "extraction") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; await window.Extraction?.mount(content); return; }
+    if (next === "extraction") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; await window.LazyModules?.ensure("extraction"); await window.Extraction?.mount(content); return; }
     if (window.LocalExplorer?.pages.has(next)) { empty.hidden=true; content.hidden=false; await window.LocalExplorer.mount(content,next); return; }
     if (next === "import") { empty.hidden = false; content.hidden = true; return; }
     if (next === "connections") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; window.RemoteSources?.mount(content); return; }
-    if (next === "log-split") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; await window.LogSplit?.mount(content); return; }
+    if (next === "log-split") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; await window.LazyModules?.ensure("log-split"); await window.LogSplit?.mount(content); return; }
     if (next === "journeys") { empty.hidden = true; content.hidden = false; await window.Journeys.render(content); return; }
     empty.hidden = workspaceScope() === "case" || state.loaded || next === "evidence" || (next === "sources" && sourceList.length > 0);
     content.hidden = !empty.hidden;

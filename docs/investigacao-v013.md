@@ -64,7 +64,7 @@ Somente campos tipados explícitos ou mapeados são comparados. Bloom elimina ca
 
 ## Persistência, orçamento e limites
 
-Fatos usam normalização `normalization-7`. Cache de interpretação e predicados tem assinatura do conteúdo e da interpretação. Apenas nós com identidade semântica estável entram no cache; matchers opacos usam confirmação nativa. Grupos de correlação têm checkpoints transacionais e remapeamento de IDs para as referências atuais. Eventos atrasados, removidos ou reordenados invalidam os grupos afetados. Estatísticas da população são reconciliadas por completo.
+Fatos usam normalização `normalization-8` (a 0.18 acrescentou resultado HTTP, sessão e localização). Cache de interpretação e predicados tem assinatura do conteúdo e da interpretação. Apenas nós com identidade semântica estável entram no cache; matchers opacos usam confirmação nativa. Grupos de correlação têm checkpoints transacionais e remapeamento de IDs para as referências atuais. Eventos atrasados, removidos ou reordenados invalidam os grupos afetados. Estatísticas da população são reconciliadas por completo.
 
 O resultado `results-3` guarda membros e entidades completos, fatos escalares consultáveis, dicionários de conteúdo, procedência comprimida sem perda e tempo original por evento. A transferência DuckDB→resultado lê lotes Arrow. Cache descartável pode ser evicto e recalculado; a evidência preservada do Caso não é removida por essa manutenção.
 

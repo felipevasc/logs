@@ -2500,3 +2500,20 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 .field-indexed { box-shadow: inset 2px 0 color-mix(in srgb, var(--accent, #7aa2f7) 35%, transparent); }
 .field-indexed .field-item > i, .detail-tree-name.field-indexed { color: color-mix(in srgb, var(--accent, #7aa2f7) 65%, var(--text, #eee)); }
 .field-row.field-indexed::after { content: ""; width: 4px; height: 4px; border-radius: 50%; background: var(--accent, #7aa2f7); opacity: .5; margin: 0 6px; flex: 0 0 auto; }
+
+/* Modo leve (computadores básicos): sem animações, transições nem desfoque; os indicadores de
+   progresso giratórios continuam, pois informam trabalho em andamento. */
+:root[data-low-power] *, :root[data-low-power] *::before, :root[data-low-power] *::after {
+  animation-duration: .001ms !important; animation-iteration-count: 1 !important; animation-delay: 0s !important;
+  transition-duration: .001ms !important; transition-delay: 0s !important; scroll-behavior: auto !important;
+  backdrop-filter: none !important;
+}
+:root[data-low-power] .fa-spin, :root[data-low-power] .spin { animation-duration: 1s !important; animation-iteration-count: infinite !important; }
+:root[data-low-power] ::view-transition-old(*), :root[data-low-power] ::view-transition-new(*) { animation: none !important; }
+.pref-block { padding: 12px 0 16px; border-bottom: 1px solid var(--border); }
+.pref-block:last-child { border-bottom: 0; }
+.pref-block h4 { margin: 0 0 6px; font-size: 13px; }
+.pref-choices, .pref-actions { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 8px 0; }
+.pref-inline { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; white-space: nowrap; }
+.pref-ok { color: var(--lv-informacao, #16a34a); }
+.pref-error { color: var(--lv-erro, #dc2626); }

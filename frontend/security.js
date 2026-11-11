@@ -12,21 +12,37 @@ window.Security = (() => {
   const names = new Map();
   let tacticFilter = null, themeFilter = null;
   let shownEpisodes = 3;
-  let minimumEvidence = 5, universe = "", summarySlots = null;
+  // levelChosen: the analyst picked a level; otherwise the page opens at the highest level with findings.
+  let minimumEvidence = 5, levelChosen = false, universe = "", summarySlots = null;
   const evidence = () => window.EvidenceUI;
   const universeKey = () => JSON.stringify([window.AnalysisContexts?.capture(), workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
-  function captureView() { return { minimumEvidence, tacticFilter, themeFilter, shownEpisodes }; }
+  function captureView() { return { minimumEvidence, levelChosen, tacticFilter, themeFilter, shownEpisodes }; }
   function restoreView(value) {
     universe = universeKey();
     minimumEvidence = Number.isInteger(value?.minimumEvidence) && value.minimumEvidence >= 1 && value.minimumEvidence <= 5 ? value.minimumEvidence : 5;
+    levelChosen = value?.levelChosen === true;
     tacticFilter = typeof value?.tacticFilter === "string" && value.tacticFilter.length <= 100 ? value.tacticFilter : null;
     themeFilter = typeof value?.themeFilter === "string" && value.themeFilter.length <= 40 ? value.themeFilter : null;
     shownEpisodes = Number.isInteger(value?.shownEpisodes) && value.shownEpisodes >= 3 && value.shownEpisodes <= 500 ? value.shownEpisodes : 3;
   }
-  function syncUniverse() { const next = universeKey(); if (next !== universe) { universe = next; minimumEvidence = 5; } }
-  function setMinimum(n) {
+  function syncUniverse() { const next = universeKey(); if (next !== universe) { universe = next; minimumEvidence = 5; levelChosen = false; } }
+  /** Highest evidence level that has findings, so the page never opens empty when something was found. */
+  function highestLevel(data) {
+    const counts = Array.isArray(data?.counts_by_level) ? data.counts_by_level : null;
+    if (!counts) return null;
+    for (let level = 5; level >= 1; level--) if ((counts[level - 1] || 0) > 0) return level;
+    return 5;
+  }
+  function adoptLevel(data) {
+    if (levelChosen) return;
+    const target = highestLevel(data);
+    if (!target || target === minimumEvidence) return;
+    queueMicrotask(() => { if (!levelChosen && cached() === data) setMinimum(target, { automatic: true }); });
+  }
+  function setMinimum(n, { automatic = false } = {}) {
     if (!Number.isInteger(n) || n < 1 || n > 5) return;
     syncUniverse(); minimumEvidence = n;
+    if (!automatic) levelChosen = true;
     const data = cached();
     if (data?.storage?.kind === "sqlite") {
       loadStoredPage(0).catch(error => toast(String(error), "err"));
@@ -111,6 +127,7 @@ window.Security = (() => {
         if (owner) window.AnalysisContexts.assertOwner(owner);
         analysisRequests.set(data, { request: selection, owner }); remember(data);
         failures.delete(scope); rememberResult(context, data, owner); previous.set(scope, true);
+        adoptLevel(data);
         return data;
       } catch (error) {
         if (scope === scopeKey() && context === key() && !pending.has(scope)) {
@@ -144,6 +161,7 @@ window.Security = (() => {
       if (run.owner) window.AnalysisContexts.assertOwner(run.owner);
       analysisRequests.set(data, { request, owner: run.owner }); remember(data);
       rememberResult(run.key, data, run.owner); previous.set(scope, true);
+      adoptLevel(data);
       return data;
     }).catch(error => {
       if (run.key === key() && scope === scopeKey()) failures.set(scope, { key: run.key, state: run.cancelled || /cancelad|ANALYSIS_CONTEXT_CHANGED/i.test(String(error)) ? "cancelled" : "failed", error: String(error) });

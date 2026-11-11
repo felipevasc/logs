@@ -79,6 +79,7 @@ pub struct Columnar {
     pub batches: usize,
     pub rows: usize,
     pub reused_batches: usize,
+    created: bool,
 }
 impl Plan {
     pub fn columnar(&self, _db: &duckdb::Connection) -> Result<Columnar, String> {
@@ -123,6 +124,7 @@ impl Plan {
             batches: 0,
             rows: 0,
             reused_batches: 0,
+            created: false,
         })
     }
 }
@@ -144,7 +146,13 @@ impl Columnar {
             self.rows += events.len();
             return Ok(());
         }
-        db.execute_batch("DROP TABLE IF EXISTS predicate_batch;CREATE TEMP TABLE predicate_batch(row_id BIGINT,projection_id INTEGER,value VARCHAR)").map_err(|e|format!("Vetor de predicados: {e}"))?;
+        // The batch table is created once per pass and emptied between batches.
+        if self.created {
+            db.execute_batch("DELETE FROM predicate_batch").map_err(|e|format!("Vetor de predicados: {e}"))?;
+        } else {
+            db.execute_batch("DROP TABLE IF EXISTS predicate_batch;CREATE TEMP TABLE predicate_batch(row_id BIGINT,projection_id INTEGER,value VARCHAR)").map_err(|e|format!("Vetor de predicados: {e}"))?;
+            self.created = true;
+        }
         let mut appender = db.appender("predicate_batch").map_err(|e| e.to_string())?;
         for (row, event) in events.iter().enumerate() {
             crate::operations::check()?;
@@ -159,7 +167,7 @@ impl Columnar {
         }
         appender.flush().map_err(|e| e.to_string())?;
         drop(appender);
-        let mut statement = db.prepare(&self.select).map_err(|e| e.to_string())?;
+        let mut statement = db.prepare_cached(&self.select).map_err(|e| e.to_string())?;
         let mut rows = statement.query([]).map_err(|e| e.to_string())?;
         let mut count = 0;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {

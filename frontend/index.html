@@ -972,6 +972,9 @@
         <button class="settings-tab" data-settings-tab="detection" type="button" role="tab">
           <i class="fas fa-shield-halved"></i> Detecção
         </button>
+        <button class="settings-tab" data-settings-tab="analysis" type="button" role="tab">
+          <i class="fas fa-gauge-high"></i> Análise
+        </button>
         <button class="settings-tab" data-settings-tab="recovery" type="button" role="tab" hidden>
           <i class="fas fa-clock-rotate-left"></i> Recuperação
         </button>
@@ -987,6 +990,7 @@
         <section id="settings-pane-codes" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-mcp" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-detection" class="settings-pane" role="tabpanel" hidden></section>
+        <section id="settings-pane-analysis" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-recovery" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-updates" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-resources" class="settings-pane" role="tabpanel" hidden></section>
@@ -1062,6 +1066,7 @@
 
   <div id="toast-area"></div>
 
+  <script src="analysis-preferences.js"></script>
   <script src="vendor/uplot/uPlot.iife.min.js"></script>
   <script src="timeline-export.js"></script>
   <script src="icon-picker.js"></script>
@@ -1104,14 +1109,11 @@
   <script src="timeline.js"></script>
   <script src="case-content.js"></script>
   <script src="case-report.js"></script>
+  <script src="lazy-modules.js"></script>
   <script src="workspace.js"></script>
   <script src="local-native.js"></script>
   <script src="local-explorer.js"></script>
   <script src="file-viewer.js"></script>
-  <script src="extraction-model.js"></script>
-  <script src="columns-engine.js"></script>
-  <script src="columns.js"></script>
-  <script src="extraction.js"></script>
   <script src="regex-syntax.js"></script>
   <script src="regex-editor.js"></script>
   <script src="regex-assist.js"></script>
@@ -1123,7 +1125,6 @@
   <script src="discovery.js"></script>
   <script src="threats.js"></script>
   <script src="remote-sources.js"></script>
-  <script src="log-split.js"></script>
   <script src="journeys.js"></script>
   <script src="case-trails.js"></script>
   <script src="workspace-context.js"></script>

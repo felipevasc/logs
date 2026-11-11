@@ -37,6 +37,98 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("Fatos normalizados: {e}")
 }
 
+struct Interpreted {
+    derived: Event,
+    normalized: Normalized,
+    key: String,
+    computed: Option<String>,
+}
+
+/// Feeds serialized bytes straight into the hash, without building the JSON text.
+struct HashWriter<'a>(&'a mut Sha256);
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Every input read by normalization is included. Presentation enrichments
+/// are excluded because the normalizer explicitly clears them. The bytes hashed
+/// are exactly those of the JSON serialization, so stored keys stay valid.
+fn fact_key(signature: &str, event: &Event) -> Result<String, String> {
+    let mut hash = Sha256::new();
+    hash.update(signature.as_bytes());
+    serde_json::to_writer(
+        HashWriter(&mut hash),
+        &(
+            crate::security_normalize::event_ref(event),
+            event.timestamp,
+            &event.source,
+            &event.code,
+            &event.message,
+            &event.raw,
+            &event.fields,
+            &event.parse_status,
+        ),
+    )
+    .map_err(error)?;
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Interpretation of one event from its stored fact or by normalizing it.
+fn interpret(
+    event: &Event,
+    payload: Option<String>,
+    mappings: &[SourceMapping],
+) -> Result<(Event, Normalized, Option<String>), String> {
+    if let Some(payload) = payload {
+        let (value, _credit) = crate::case_evidence::parse_exact_value(&payload)?.into_parts();
+        let fact: Fact = serde_json::from_value(value).map_err(error)?;
+        let mut derived = event.clone();
+        derived.fields.retain(|key, _| !key.starts_with("_sec."));
+        derived.fields.extend(fact.fields);
+        derived.timestamp = fact.timestamp;
+        derived.event_ref = crate::security_normalize::event_ref(event);
+        derived.name.clear();
+        derived.description.clear();
+        return Ok((derived, fact.normalized, None));
+    }
+    let (derived, normalized) = crate::security_normalize::normalize(event, mappings);
+    let fact = Fact {
+        fields: derived
+            .fields
+            .iter()
+            .filter(|(key, _)| key.starts_with("_sec."))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        timestamp: derived.timestamp,
+        normalized: normalized.clone(),
+    };
+    let payload = serde_json::to_string(&fact).map_err(error)?;
+    Ok((derived, normalized, Some(payload)))
+}
+
+/// Parallel waves work on chunks; one event per closure would cost more than it saves.
+fn chunked(events: Vec<Event>) -> Vec<Vec<Event>> {
+    const CHUNK: usize = 64;
+    let mut out = Vec::with_capacity(events.len().div_ceil(CHUNK));
+    let mut current = Vec::with_capacity(CHUNK);
+    for event in events {
+        current.push(event);
+        if current.len() == CHUNK {
+            out.push(std::mem::replace(&mut current, Vec::with_capacity(CHUNK)));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
 impl Facts {
     pub fn new(mappings: &[SourceMapping]) -> Result<Self, String> {
         let signature = crate::evidence::stable_id(
@@ -45,6 +137,7 @@ impl Facts {
                 crate::evidence::NORMALIZATION_VERSION.to_string(),
                 serde_json::to_string(mappings).map_err(error)?,
                 crate::analysis_runtime::fact_namespace(),
+                crate::geoip::signature(),
             ],
         );
         #[cfg(test)]
@@ -94,57 +187,83 @@ impl Facts {
         mappings: &[SourceMapping],
     ) -> Result<(Event, Normalized), String> {
         crate::operations::check()?;
-        // Every input read by normalization is included. Presentation enrichments
-        // are excluded because the normalizer explicitly clears them.
-        let mut hash = Sha256::new();
-        hash.update(self.signature.as_bytes());
-        hash.update(
-            serde_json::to_vec(&(
-                crate::security_normalize::event_ref(event),
-                event.timestamp,
-                &event.source,
-                &event.code,
-                &event.message,
-                &event.raw,
-                &event.fields,
-                &event.parse_status,
-            ))
-            .map_err(error)?,
-        );
-        let key = format!("{:x}", hash.finalize());
+        let key = fact_key(&self.signature, event)?;
         self.current_key = key.clone();
-        let payload: Option<String> = self
-            .db
+        let payload = self.lookup(&key)?;
+        let (derived, normalized, computed) = interpret(event, payload, mappings)?;
+        self.store(&key, computed)?;
+        Ok((derived, normalized))
+    }
+
+    /// Same results as calling [`Facts::normalize`] for each event in order.
+    /// Hashing, decoding stored facts and normalizing run in parallel waves;
+    /// the SQLite reads and writes stay sequential on this connection.
+    pub fn normalize_batch(
+        &mut self,
+        events: Vec<Event>,
+        mappings: &[SourceMapping],
+    ) -> Result<Vec<(Event, Normalized, String)>, String> {
+        crate::operations::check()?;
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let signature = self.signature.clone();
+        let chunks = chunked(events);
+        let keyed: Vec<Result<Vec<(Event, String)>, String>> =
+            crate::global_scheduler::map(chunks, |chunk| {
+                chunk
+                    .into_iter()
+                    .map(|event| fact_key(&signature, &event).map(|key| (event, key)))
+                    .collect()
+            });
+        let mut pending = Vec::new();
+        for chunk in keyed {
+            let mut items = Vec::new();
+            for (event, key) in chunk? {
+                let payload = self.lookup(&key)?;
+                items.push((event, key, payload));
+            }
+            pending.push(items);
+        }
+        let interpreted: Vec<Result<Vec<Interpreted>, String>> =
+            crate::global_scheduler::map(pending, |chunk| {
+                chunk
+                    .into_iter()
+                    .map(|(event, key, payload)| {
+                        interpret(&event, payload, mappings).map(|(derived, normalized, computed)| {
+                            Interpreted { derived, normalized, key, computed }
+                        })
+                    })
+                    .collect()
+            });
+        let mut out = Vec::new();
+        for chunk in interpreted {
+            for item in chunk? {
+                self.store(&item.key, item.computed)?;
+                out.push((item.derived, item.normalized, item.key));
+            }
+        }
+        if let Some((_, _, key)) = out.last() {
+            self.current_key = key.clone();
+        }
+        Ok(out)
+    }
+
+    fn lookup(&mut self, key: &str) -> Result<Option<String>, String> {
+        self.db
             .prepare_cached("SELECT payload FROM facts WHERE k=?1")
             .map_err(error)?
-            .query_row([&key], |r| r.get(0))
+            .query_row([key], |r| r.get(0))
             .optional()
-            .map_err(error)?;
-        if let Some(payload) = payload {
-            let (value, _credit) = crate::case_evidence::parse_exact_value(&payload)?.into_parts();
-            let fact: Fact = serde_json::from_value(value).map_err(error)?;
-            let mut derived = event.clone();
-            derived.fields.retain(|key, _| !key.starts_with("_sec."));
-            derived.fields.extend(fact.fields);
-            derived.timestamp = fact.timestamp;
-            derived.event_ref = crate::security_normalize::event_ref(event);
-            derived.name.clear();
-            derived.description.clear();
+            .map_err(error)
+    }
+
+    /// `computed` carries the serialized fact of a cache miss; `None` was a hit.
+    fn store(&mut self, key: &str, computed: Option<String>) -> Result<(), String> {
+        let Some(payload) = computed else {
             self.hits += 1;
-            return Ok((derived, fact.normalized));
-        }
-        let (derived, normalized) = crate::security_normalize::normalize(event, mappings);
-        let fact = Fact {
-            fields: derived
-                .fields
-                .iter()
-                .filter(|(key, _)| key.starts_with("_sec."))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-            timestamp: derived.timestamp,
-            normalized: normalized.clone(),
+            return Ok(());
         };
-        let payload = serde_json::to_string(&fact).map_err(error)?;
         self.maintain(payload.len() as u64)?;
         self.serial += 1;
         self.db
@@ -157,7 +276,7 @@ impl Facts {
         if self.pending >= 1024 {
             self.checkpoint()?;
         }
-        Ok((derived, normalized))
+        Ok(())
     }
 
     pub fn checkpoint(&mut self) -> Result<(), String> {

@@ -11,6 +11,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.7", features = [] }
+# Compact ATT&CK index generated from the reviewed STIX bundle.
+serde_json = "1"
 
 [dependencies]
 log-learning = { path = "../crates/log-learning" }

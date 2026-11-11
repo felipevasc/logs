@@ -37,7 +37,8 @@ pub fn find(key: &str) -> Option<&'static Theme> {
 /// Builtin and Case rules, by id.
 fn by_rule(rule: &str) -> Option<&'static str> {
     let exact = match rule {
-        "exec.webshell-child" => Some("upload"),
+        "exec.webshell-child" | "web.script-appeared" => Some("upload"),
+        "web.attack.size-outlier" => Some("exposure"),
         "attempt.reverse-shell.request" | "attempt.reverse-shell.process" | "content.reverse_payload" | "c2.reverse-shell" | "c2.socat-exec" => Some("execution"),
         "web.scan" | "web.success-after-scan" | "net.portscan" | "net.hostscan" | "exec.discovery-burst" => Some("discovery"),
         "net.sensitive-port.public" | "auth.rdp.public" => Some("lateral"),
@@ -55,6 +56,9 @@ fn by_rule(rule: &str) -> Option<&'static str> {
     }
     let prefixes: &[(&str, &str)] = &[
         ("client.", "clients"),
+        ("webshell.", "upload"),
+        ("geo.", "credentials"),
+        ("session.", "credentials"),
         ("tool.", "clients"),
         ("content.passwd_", "exposure"),
         ("content.shadow_", "exposure"),
@@ -185,6 +189,7 @@ mod tests {
             include_str!("../resources/detection-content.json"),
             include_str!("../resources/detection-expansion.json"),
             include_str!("../resources/detection-clients.json"),
+            include_str!("../resources/detection-behavior.json"),
         ] {
             let rules: serde_json::Value = serde_json::from_str(file).unwrap();
             for rule in rules["rules"].as_array().unwrap() {
@@ -217,6 +222,12 @@ mod tests {
         assert_eq!(of("client.forged-browser", &[], &[]), "clients");
         assert_eq!(of("auth.bruteforce.source", &[], &[]), "credentials");
         assert_eq!(of("chain.ad.rbcd-use", &[], &[]), "credentials");
+        assert_eq!(of("webshell.new-script", &[], &[]), "upload");
+        assert_eq!(of("web.script-appeared", &[], &[]), "upload");
+        assert_eq!(of("web.attack.size-outlier", &[], &[]), "exposure");
+        assert_eq!(of("web.attack.server-error", &[], &[]), "web");
+        assert_eq!(of("geo.impossible-travel", &[], &[]), "credentials");
+        assert_eq!(of("session.multi-browser", &[], &[]), "credentials");
         let sigma = |id: &str| crate::attack::reference(id, &[]);
         assert_eq!(of("4f2a-sigma", &[sigma("T1505.003")], &[]), "upload");
         assert_eq!(of("4f2a-sigma", &[sigma("T1059.001")], &[]), "execution");

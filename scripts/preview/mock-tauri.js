@@ -690,6 +690,11 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     // The preview cannot zoom the browser; screenshots emulate a scale with the viewport.
     ui_zoom: () => false,
     resource_settings_status: () => resourceStatus(),
+    // Offline IP location base: installed only when the analyst imports or downloads it.
+    geoip_status: () => structuredClone(window.__mockGeoip ||= { loaded: false, files: [], directory: "C:\\Users\\preview\\AppData\\Roaming\\LogInsight\\geoip", download_url: "https://iptoasn.com/data/ip2asn-combined.tsv.gz", error: null }),
+    geoip_import: ({ path }) => { const base = handlers.geoip_status(); window.__mockGeoip = { ...base, loaded: true, files: [{ name: String(path).split(/[\\/]/).pop(), bytes: 1024, ranges: 3, modified_ms: Date.now() }] }; return structuredClone(window.__mockGeoip); },
+    geoip_download: () => handlers.geoip_import({ path: "ip2asn-combined.tsv.gz" }),
+    geoip_remove: () => { const base = handlers.geoip_status(); window.__mockGeoip = { ...base, loaded: false, files: [] }; return structuredClone(window.__mockGeoip); },
     resource_settings_save: ({ preferences }) => {
       const valid = window.ResourceSettings.preferences(preferences.mode, String(preferences.memoryLimitMib), 8192, preferences.parallelismLimit, 8);
       if (preferences.schemaVersion !== 1) throw Error("Versão de configuração não suportada.");

@@ -143,6 +143,8 @@ fn saved_path(
     hash.update(serde_json::to_string(settings).unwrap_or_default());
     hash.update(catalog.map(|c| c.signature()).unwrap_or_default());
     hash.update(format!("{expired:?}"));
+    // Empty without an installed base, so results computed before stay valid.
+    hash.update(crate::geoip::signature());
     Some(crate::config_dir().join("triage-v1").join(format!("{:x}.sqlite", hash.finalize())))
 }
 

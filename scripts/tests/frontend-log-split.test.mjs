@@ -57,7 +57,9 @@ test('incomplete criteria are explained before anything runs', ()=>{
 test('the page is reachable from Estrutura and bundled', ()=>{
   const html=read('frontend/index.html'), workspace=read('frontend/workspace.js'), tasks=read('frontend/tasks.js'), bundle=read('scripts/prepare-frontend.mjs');
   assert.match(html,/data-page="log-split" data-zones="structure"/);
-  assert.match(html,/<script src="log-split\.js"><\/script>/);
+  // Loaded on first open of the page, not at startup.
+  assert.match(read('frontend/lazy-modules.js'),/"log-split": \["log-split\.js"\]/);
+  assert.match(workspace,/LazyModules\?\.ensure\("log-split"\); await window\.LogSplit\?\.mount/);
   assert.match(html,/href="log-split\.css"/);
   assert.match(workspace,/const STRUCTURE = new Set\(\[[^\]]*"log-split"/);
   assert.match(workspace,/next === "log-split"[^\n]*LogSplit\?\.mount/);

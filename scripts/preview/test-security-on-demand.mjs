@@ -42,7 +42,9 @@ try {
   await page.evaluate(() => { window.__mockFailures = {}; });
   await page.locator('[data-calculate-compromises]').click(); await stateIs('ready');
   assert.equal(await calls(), 3);
-  assert.match(await page.locator('.evidence-empty').innerText(), /Nenhum indício no nível/);
+  // The result opens at the highest level with findings instead of an empty level 5.
+  await page.waitForSelector('.sec-episode');
+  assert.equal(await page.locator('.evidence-empty').count(), 0);
   for (const name of ['summary', 'compromises', 'summary', 'compromises']) await page.evaluate(name => Workspace.showPage(name), name);
   assert.equal(await calls(), 3, 'returning to a valid result must not rescan');
   await page.locator('[data-evidence-min="2"]').first().click();
