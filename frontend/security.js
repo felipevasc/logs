@@ -851,6 +851,8 @@ window.Security = (() => {
     if (attention) await restore();
   }
   function drawSummary(attention, data) {
+    const scopeSignals=attention.parentElement?.querySelector("#ws-signals");
+    if(scopeSignals?.updateSecurity) void scopeSignals.updateSecurity(data);
     attention.hidden = false; attention.className = 'ws-card sec-summary'; attention.dataset.analysisState = "ready"; attention.removeAttribute("aria-busy");
     const counts = data.universe_counts_by_level || data.counts_by_level || [0,0,0,0,0], max = Math.max(1,...counts);
     attention.innerHTML = `${previousNotice()}<div class="card-heading"><h2>Comprometimentos</h2><button class="text-button" data-open-compromises>Abrir análise <i class="fas fa-arrow-right"></i></button></div><p class="small muted">Indícios por força da evidência · ${fmtNum(data.total)} registros no conjunto completo · filtros do Explorar não se aplicam</p><div class="sec-count-chart" role="group" aria-label="Número de indícios por força da evidência">${[5,4,3,2,1].map(n=>`<button class="sec-chart-row evidence-e${n}" data-chart-level="${n}" aria-label="${evidence().label(n)}: ${counts[n-1]} indícios"><span>${evidence().label(n)}</span><span class="sec-chart-track"><span style="width:${100*counts[n-1]/max}%"></span></span><strong>${fmtNum(counts[n-1])}</strong></button>`).join('')}</div>`;

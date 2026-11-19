@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdir } from 'node:fs/promises';
 import { launchBrowser } from './browser.mjs';
 import { captureFailure } from './diagnostics.mjs';
+import { verifyOperationalSummary } from './test-operational-summary.mjs';
 const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
 const errors = []; page.on('pageerror', error => errors.push(error.message));
@@ -83,6 +84,8 @@ try {
   await host.getByText(/Resultado incompleto ou de outra análise/).waitFor();
   assert.equal(await page.evaluate(() => window.__mockRequests.filter(row => row.cmd === "triage" && !row.cacheOnly).length), 1, 'paging and hunts never scan');
   assert.deepEqual(errors, []);
+  phase = 'inline operational evidence';
+  await verifyOperationalSummary(browser);
   console.log(JSON.stringify({ queue: true, localLearning: true, explicitSharing: true, tokenCleared: true, exactOriginalEvent: true, hunts: true, escapedText: true, literalOriginalValues: true, staleAnalysisRejected: true, errors }, null, 2));
 } catch (error) { await captureFailure(page, 'test-investigation', error, { phase }); throw error; }
 finally { await browser.close(); }

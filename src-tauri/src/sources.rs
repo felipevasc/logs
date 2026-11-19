@@ -5,6 +5,7 @@ use crate::model::{
 use chrono::Datelike;
 use serde_json::{Map, Value};
 
+mod batches;
 mod generic;
 mod labeled;
 mod nmap;
@@ -21,7 +22,7 @@ mod xml_log;
 /// so all of them moved to a new revision; captured snapshots are evidence
 /// and never reparsed.
 pub(crate) fn parser_semantics_signature(format: &str) -> Option<&'static str> {
-    (format != "snapshot").then_some("universal-v6")
+    if format == "jsonl" { Some("json-batches-v1") } else { (format != "snapshot").then_some("universal-v6") }
 }
 
 /// Any text parser may complete year-less or time-only values from the
@@ -819,6 +820,12 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 }
 
 fn read_json_string(bytes: &[u8], i: usize) -> Option<(String, usize)> {
+    let end=json_string_end(bytes,i)?;
+    let raw=&bytes[i+1..end-1];
+    let name=if raw.contains(&b'\\'){serde_json::from_slice::<String>(&bytes[i..end]).ok()?}else{String::from_utf8_lossy(raw).into_owned()};
+    Some((name,end))
+}
+fn json_string_end(bytes:&[u8],i:usize)->Option<usize>{
     if bytes.get(i) != Some(&b'"') {
         return None;
     }
@@ -826,7 +833,7 @@ fn read_json_string(bytes: &[u8], i: usize) -> Option<(String, usize)> {
     while j < bytes.len() {
         match bytes[j] {
             b'\\' => j += 2,
-            b'"' => return Some((String::from_utf8_lossy(&bytes[i + 1..j]).into_owned(), j + 1)),
+            b'"' => return Some(j+1),
             _ => j += 1,
         }
     }
@@ -837,14 +844,14 @@ fn read_json_string(bytes: &[u8], i: usize) -> Option<(String, usize)> {
 fn skip_json_value(bytes: &[u8], i: usize) -> Option<usize> {
     let i = skip_ws(bytes, i);
     match bytes.get(i)? {
-        b'"' => read_json_string(bytes, i).map(|(_, end)| end),
+        b'"' => json_string_end(bytes, i),
         b'{' | b'[' => {
             let mut depth = 0usize;
             let mut j = i;
             while j < bytes.len() {
                 match bytes[j] {
                     b'"' => {
-                        j = read_json_string(bytes, j)?.1;
+                        j = json_string_end(bytes, j)?;
                         continue;
                     }
                     b'{' | b'[' => depth += 1,
@@ -2734,6 +2741,7 @@ pub struct FilePart {
     pub path: String,
     /// Actual immutable input backing the mapping (display paths may be virtual).
     pub physical_path: String,
+    pub(crate) batches: Option<std::sync::Arc<batches::Layout>>,
     pub physical_file_id: Option<(u64, u64)>,
     pub(crate) calendar: ParserCalendar,
     pub(crate) event_identity: Option<String>,
@@ -3218,7 +3226,13 @@ pub fn parse_line(
 }
 
 pub(crate) fn parse_part_line(part: &FilePart, bytes: &[u8]) -> Event {
-    parse_line_in(bytes, &part.format, part.custom.as_ref(), &part.header, &part.calendar.context())
+    let mut ev=parse_line_in(bytes, &part.format, part.custom.as_ref(), &part.header, &part.calendar.context());
+    if let Some(layout)=&part.batches {
+        if let Some(pos)=(bytes.as_ptr() as usize).checked_sub(part.mmap.as_ptr() as usize).filter(|&p| p<part.mmap.len()){
+            layout.annotate(&part.mmap,pos,&mut ev);
+        }
+    }
+    ev
 }
 
 pub(crate) fn parse_line_at(bytes: &[u8], format: &str, custom: Option<&CustomParse>, header: &[String], year: i32) -> Event {
@@ -3812,7 +3826,8 @@ pub(crate) fn prepare_index_from(path: &str, origin: Option<(&str, &str)>, forma
     let stamp = SourceStamp::read(&file, path)?;
     if stamp.bytes == 0 { return Err("Arquivo vazio.".into()); }
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| format!("Falha ao mapear '{path}': {e}"))?;
-    let fmt = if format == "auto" {
+    let list_choice=format.strip_prefix("json-list:");
+    let fmt = if list_choice.is_some() { "jsonl".to_string() } else if format == "auto" {
         // An inconclusive prefix must not disable recognition for later rows.
         // Explicitly requested plain text still keeps its literal semantics.
         match detect_format(&mmap) { "text" => "mixed", detected => detected }.to_string()
@@ -3876,9 +3891,21 @@ pub(crate) fn prepare_index_from(path: &str, origin: Option<(&str, &str)>, forma
     });
     let content_start = if mmap.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
     let first_byte = (content_start..mmap.len()).find(|&i| !mmap[i].is_ascii_whitespace());
-    let array = first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'[').map(|start| (start, false))
+    let batch=first_byte.filter(|&i| fmt=="jsonl" && mmap[i]==b'{' && (!looks_like_jsonl(&mmap[i..]) ||
+        list_choice.is_some() || ["\"resourceLogs\"","\"records\"","\"Records\"","\"events\"","\"logRecords\""].iter().any(|k|memchr::memmem::find(&mmap[i..mmap.len().min(i+65536)],k.as_bytes()).is_some())))
+        .and_then(|i| batches::detect(&mmap,i,list_choice)).map(std::sync::Arc::new);
+    if list_choice.is_some_and(|choice|batch.as_ref().is_none_or(|b|!b.choices.contains_key(choice))) {
+        // A remembered source may have rotated to a different envelope or
+        // even another format. Give the new document its normal import path.
+        drop(batch);
+        drop(mmap);
+        drop(file);
+        drop(canonical_lease);
+        return prepare_index_from(path, origin, "auto", custom, saved_ts);
+    }
+    let array = if let Some(layout)=&batch {layout.groups.first().map(|g|(g.open,true))} else {first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'[').map(|start| (start, false))
         .or_else(|| first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'{' && !looks_like_jsonl(&mmap[i..]))
-            .and_then(|_| json_envelope_array(&mmap)).map(|start| (start, true)));
+            .and_then(|_| json_envelope_array(&mmap)).map(|start| (start, true)))};
     let stream = if array.is_none() && fmt == "jsonl" {
         first_byte.filter(|&i| mmap[i] == b'{' && !looks_like_jsonl(&mmap[i..])).and_then(|_| json_stream_start(&mmap))
     } else { None };
@@ -3893,7 +3920,7 @@ pub(crate) fn prepare_index_from(path: &str, origin: Option<(&str, &str)>, forma
         limits: IndexLimits::default(), parsed_rows: std::sync::atomic::AtomicUsize::new(0),
         descriptor: IndexDescriptor { requested_format: format.into(), format: fmt.clone(), custom: custom_descriptor, header: header.clone(), header_at, start_pattern, array, stream, xml },
         stamp,
-        part: FilePart { path: path.into(), physical_path: path.into(), physical_file_id: file_identity(&file), calendar, canonical_lease, event_identity, metadata_identity: String::new(),
+        part: FilePart { batches:batch, path: path.into(), physical_path: path.into(), physical_file_id: file_identity(&file), calendar, canonical_lease, event_identity, metadata_identity: String::new(),
             file_name: file_name_of(path), format: fmt, custom, ts_config: saved_ts, header, mmap: std::sync::Arc::new(mmap), base: 0, identity },
     };
     prepared.validate()?;
@@ -3931,6 +3958,17 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
     if !resume.scan_complete {
         match (prepared.descriptor.array, prepared.descriptor.stream) {
             _ if prepared.descriptor.xml.is_some() => index_xml_records(&prepared, resume.cursor, &mut resume.lines, sink, reporter)?,
+            _ if prepared.part.batches.as_ref().is_some_and(|b|!b.groups.is_empty()) => {
+                for g in &prepared.part.batches.as_ref().unwrap().groups {
+                    if resume.cursor<g.end {
+                        if g.single{
+                            resume.lines.extend(vec![meta_for_line(&bytes[g.open..g.end],g.open as u64,&prepared.part)?])?;
+                        }else{
+                            index_json_array(prepared,g.open,true,false,resume.cursor.max(g.open+1),&mut resume.lines,sink,reporter)?;
+                        }
+                    }
+                }
+            }
             (Some((start, envelope)), _) => index_json_array(&prepared, start, envelope, false, resume.cursor, &mut resume.lines, sink, reporter)?,
             (None, Some(start)) => index_json_array(&prepared, start, false, true, resume.cursor, &mut resume.lines, sink, reporter)?,
             (None, None) => index_lines(&prepared, &mut resume.lines, resume.cursor, sink, reporter)?,

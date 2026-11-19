@@ -161,7 +161,7 @@ window.InvestigationUI = (() => {
               article.append(node('p', 'As comparações mantêm a origem, o contexto disponível e o intervalo. Associação não demonstra causa.', 'small muted'));
               if (!comparisons.length) article.append(node('p', 'Não há grupos comparáveis suficientes para distinguir uma explicação.'));
               for (const comparison of comparisons) {
-                const row = node('div'); row.append(node('p', comparison.hypothesis), node('p', `${comparison.field}=${comparison.value}: ${comparison.unusual}/${comparison.observations} registros incomuns; outros grupos: ${comparison.comparison_unusual}/${comparison.comparison_observations}.`, 'small muted')); article.append(row);
+                const row = node('div'); row.append(node('p', comparison.hypothesis), node('p', `${comparison.field}=${comparison.value}: ${comparison.unusual}/${comparison.observations} registros incomuns; outros grupos: ${comparison.comparison_unusual}/${comparison.comparison_observations}. Campo ausente em ${comparison.unknown_observations ?? 0} registros.`, 'small muted')); article.append(row);
               }
             }
             const actions = node('div', null, 'investigation-navigation');

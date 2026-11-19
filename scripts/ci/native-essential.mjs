@@ -7,6 +7,7 @@ if (learning.status !== 0) process.exit(learning.status ?? 1);
 
 const base = ['test', '--manifest-path', 'src-tauri/Cargo.toml', '--release', '--locked'];
 const units = [
+  'operational::tests::', 'sources::batches::tests::', 'local_learning::missing_versions_do_not_become_the_control_group',
   'cache_validation::tests::', 'computed_cache::tests::',
   'metadata_checkpoint::tests::', 'index_cache::timestamp_overlay_tests::',
   'engine::build::checkpoint_tests::', 'engine::time_index::tests::',

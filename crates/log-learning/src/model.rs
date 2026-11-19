@@ -94,6 +94,18 @@ pub fn tokens(message: &str) -> Vec<String> {
             let word = word.trim_matches(|c: char| {
                 matches!(c, '"' | '\'' | ',' | ';' | '[' | ']' | '(' | ')')
             });
+            if let Some((key, value)) = word.split_once('=') {
+                if !key.is_empty() && key.len() <= 40 && key.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-')) {
+                    let key = key.to_ascii_lowercase();
+                    let leaf = key.rsplit(['.', '_']).next().unwrap_or(&key);
+                    let category = matches!(leaf, "state" | "estado" | "status" | "result" | "resultado" | "outcome" | "phase" | "stage" | "action" | "event" | "level" | "severity" | "tipo" | "type" | "code");
+                    let value = value.trim_matches(['"', '\'']);
+                    if category && !value.is_empty() && value.len() <= 32 && value.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_')) {
+                        return format!("{key}={}",value.to_lowercase());
+                    }
+                    return format!("{key}=*");
+                }
+            }
             if word.len() > 48
                 || word.chars().any(|c| c.is_ascii_digit())
                 || word.contains('=')
@@ -139,7 +151,7 @@ fn matching(clusters: &[Cluster], words: &[String]) -> Option<usize> {
                 .tokens
                 .iter()
                 .zip(words)
-                .any(|(a, b)| a != b && (anchor(a) || anchor(b)))
+                .any(|(a, b)| a != b && (anchor(a) || anchor(b) || a.contains('=') || b.contains('=')))
             {
                 return None;
             }

@@ -502,6 +502,24 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
       }
       return { saved: true, path: filename, bytes: bytes.length };
     },
+    operational_report: ({filters,caseEvents}) => {
+      const rows=applyFilters(filters,poolOf(caseEvents)), groups=new Map();
+      for(const e of rows){
+        const key=e.source||"";
+        if(!groups.has(key))groups.set(key,{n:0,patterns:new Map()});
+        const g=groups.get(key);g.n++;
+        const family=e.fields?.estado||e.fields?.state||e.code||e.message;
+        if(!g.patterns.has(family))g.patterns.set(family,{count:0,examples:[]});
+        const familyGroup=g.patterns.get(family);familyGroup.count++;
+        if(familyGroup.examples.length<3)familyGroup.examples.push({...e,file:e.fields?.arquivo,role:"Ocorrência"});
+      }
+      const signals=[];
+      for(const [source,g] of groups)for(const [family,item]of g.patterns){
+        if(item.count>3||item.count*20>g.n)continue;
+        signals.push({kind:"rare",title:"Ocorrência rara · "+family,source,count:item.count,population:g.n,detail:"Contagem dos registros da origem na prévia.",observed:[],reference:[],measures:[],examples:item.examples,priority:35});
+      }
+      return {signals:signals.slice(0,16),total:rows.length,undated:rows.filter(e=>e.timestamp==null).length,reviews:{},limited:signals.length>16};
+    },
     dataset_overview: ({filters,caseEvents}) => overviewFor(applyFilters(filters,poolOf(caseEvents))),
     timeline_range: ({filters,start,end,bucketCount,caseEvents}) => {
       if (start > end) throw new Error("O início deve ser anterior ao fim.");
@@ -1405,7 +1423,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
           args = { ...args, caseEvents: admitted.rows };
         }
         try {
-          const scopedCommands=['list_sources','source_summary','event_detail','analysis_field_text','java_trace_detail','triage','triage_evidence_event','grouped_timeline','query_page','query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
+          const scopedCommands=['list_sources','source_summary','event_detail','analysis_field_text','java_trace_detail','triage','triage_evidence_event','grouped_timeline','query_page','query_events','explore_snapshot','stats_events','dataset_overview','operational_report','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
           if (scopedCommands.includes(cmd) && args.analysisContext) args = { ...args, caseEvents: analysisRows(exclusions?.visible(args.analysisContext, poolOf(args.caseEvents)) || poolOf(args.caseEvents), analysisFor(args)) };
           if(scopedCommands.includes(cmd)&&args.filters?.some(filter=>filter.op==='threat_rule')){
             const module=await import('/__mock-threats__.js');

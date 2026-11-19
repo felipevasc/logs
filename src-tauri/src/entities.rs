@@ -274,6 +274,7 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("syscheck.path", Role::File, 1),
     ("data.win.eventdata.targetfilename", Role::File, 1),
     ("http.response.status_code", Role::Status, 0),
+    ("http.status_code", Role::Status, 0),
     ("status_code", Role::Status, 1),
     ("statuscode", Role::Status, 1),
     ("sc-status", Role::Status, 1),
@@ -647,9 +648,18 @@ fn is_http_status(code: &str) -> bool {
 }
 
 fn has_http_shape(ev: &Event) -> bool {
-    ["method", "cs-method", "http.request.method", "request_method", "verb"]
+    ["method", "cs-method", "http.request.method", "request_method", "verb", "http.response.status_code", "http.status_code", "http.response.body", "http.response.body.content", "response.body", "response_body"]
         .iter()
         .any(|k| ev.fields.contains_key(*k))
+}
+
+pub(crate) fn http_status(ev: &Event) -> Option<u16> {
+    if !has_http_shape(ev) && field_ci(ev,"event.action").as_deref()!=Some("http_request"){return None}
+    value(ev,Role::Status)?.trim().parse().ok().filter(|n|(100..600).contains(n))
+}
+
+fn http_outcome(ev:&Event)->Option<&'static str>{
+    http_status(ev).map(|n|if n<400{"success"}else{"failure"})
 }
 
 /// Value of a `@role` virtual column.
@@ -737,7 +747,10 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
     // ECS-shaped sources already carry both.
     let explicit_action = field_ci(ev, "event.action");
     let explicit_outcome = field_ci(ev, "event.outcome").and_then(|v| textual_outcome(&v));
-    if let Some(a) = explicit_action_static(explicit_action.as_deref()) { return (Some(a), explicit_outcome); }
+    if let Some(a) = explicit_action_static(explicit_action.as_deref()) {
+        let outcome=if a=="http_request"{explicit_outcome.or_else(||http_outcome(ev))}else{explicit_outcome};
+        return (Some(a),outcome);
+    }
     let hint = provider_hint(ev);
     let code = ev.code.trim();
 
@@ -971,12 +984,8 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
     }
 
     // HTTP status describes transport/application response, never authentication.
-    if let Some(status) = value(ev, Role::Status) {
-        if let Ok(number) = status.trim().parse::<u16>() {
-            if (100..600).contains(&number) && has_http_shape(ev) {
-                return (Some("http_request"), Some(if number < 400 { "success" } else { "failure" }));
-            }
-        }
+    if let Some(outcome) = http_outcome(ev) {
+        return (Some("http_request"),Some(outcome));
     }
 
     // Firewalls and sensors.
@@ -1029,7 +1038,15 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
             }
         }
     }
-    (explicit_action_static(explicit_action.as_deref()), explicit_outcome)
+    let declared = explicit_outcome.or_else(|| ["outcome","result","state","status","resultado","estado","event"].iter().find_map(|key| {
+        let value=ev.fields.get(*key)?.as_str()?;
+        match value.trim().to_ascii_lowercase().as_str(){
+            "completed" | "concluido" | "concluído" => Some("success"),
+            "rejeitado" => Some("failure"),
+            _=>textual_outcome(value)
+        }
+    }));
+    (explicit_action_static(explicit_action.as_deref()), declared)
 }
 
 fn explicit_action_static(value: Option<&str>) -> Option<&'static str> {

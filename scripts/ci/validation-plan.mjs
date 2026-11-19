@@ -17,6 +17,7 @@ export const essentialPreview = [
   'test-native-case-timeline.mjs', 'test-updates.mjs',
 ];
 const affected = [
+  [/^frontend\/operational\.(?:js|css)$/, ['test-operational-summary.mjs']],
   [/^frontend\/(?:local-explorer|local-native|file-viewer)\.(?:js|css)$/, ['test-local-explorer.mjs']],
   [/^frontend\/(?:regex-|event-pattern-search|event-context|field-extraction)/, ['test-regex-workbench.mjs']],
   [/^frontend\/resources\.(?:js|css)$/, ['test-resources.mjs']],

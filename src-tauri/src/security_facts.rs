@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub const VERSION: &str = "security-facts-2";
+pub const VERSION: &str = "security-facts-3";
 
 #[derive(Serialize, Deserialize)]
 struct Fact {

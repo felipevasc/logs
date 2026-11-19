@@ -1241,6 +1241,7 @@ async function loadData(requestedSource = null, options = {}) {
         if (!source.paths.length) return;
       }
     }
+    if (window.Operational) source=window.Operational.applyChoices(source);
     if (source.kind === "eventlog" && !source.channel) source.channel = "Application";
     const c = caseId
       ? state.cases.cases.find((item) => item.id === caseId)

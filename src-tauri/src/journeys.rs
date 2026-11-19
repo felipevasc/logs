@@ -183,7 +183,7 @@ enum Records<'a> {
     Indexed(&'a FileIndex),
     Empty,
 }
-struct View<'a> {
+pub(crate) struct View<'a> {
     records: Records<'a>,
     prepared: Vec<PreparedFilter>,
     codes: &'a CodesConfig,
@@ -191,7 +191,7 @@ struct View<'a> {
     derived: &'a [CompiledDerived],
 }
 impl View<'_> {
-    fn fetch(&self, index: usize) -> Result<Event, String> {
+    pub(crate) fn fetch(&self, index: usize) -> Result<Event, String> {
         match self.records {
             Records::Memory(events) => Ok(events[index].clone()),
             Records::Indexed(file) => {
@@ -202,7 +202,7 @@ impl View<'_> {
             Records::Empty => unreachable!(),
         }
     }
-    fn scan(&self, mut visit: impl FnMut(usize, &Event) -> Result<(), String>) -> Result<(), String> {
+    pub(crate) fn scan(&self, mut visit: impl FnMut(usize, &Event) -> Result<(), String>) -> Result<(), String> {
         self.scan_mapped(|_| (), |i, event, ()| visit(i, event))
     }
     /// Like `scan`, with `map` run in parallel on each indexed event.
@@ -246,7 +246,7 @@ impl View<'_> {
         operations::check()
     }
 }
-fn with_view<T>(
+pub(crate) fn with_view<T>(
     state: &AppState,
     filters: &[Filter],
     case: Option<&[Event]>,
@@ -274,7 +274,7 @@ fn with_view<T>(
         derived: &derived,
     })
 }
-fn db() -> Result<Connection, String> {
+pub(crate) fn db() -> Result<Connection, String> {
     let db = Connection::open("").map_err(|e| {
         format!("Não foi possível abrir armazenamento temporário das jornadas: {e}")
     })?;

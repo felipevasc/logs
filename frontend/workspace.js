@@ -181,23 +181,32 @@
       if (state.activeOperation?.kind === "summary") finishOperation("Resumo atualizado", `${fmtNum(data.total)} eventos analisados`);
       updateCounts();
       const dated = data.total - data.undated;
-      content.innerHTML = `<div class="metric-grid">
+      content.innerHTML = `${!data.complete ? note("Análise interrompida. Atualize para calcular o conjunto completo.") : ""}<div id="ws-signals"></div><details class="op-secondary"><summary>Estatísticas · ${fmtNum(data.total)} eventos · ${fmtNum(data.errors)} com nível de erro ou crítico</summary><div class="metric-grid">
         ${metric("Eventos", fmtNum(data.total), data.start == null ? "Sem horário reconhecido" : `${esc(fmtTs(data.start).slice(0, 11))} — ${esc(fmtTs(data.end).slice(0, 11))}`)}
         ${metric("Erros", fmtNum(data.errors), `${pct(data.errors / Math.max(1, data.total))} do recorte`, "error")}
         ${metric("Avisos", fmtNum(data.warnings), `${pct(data.warnings / Math.max(1, data.total))} do recorte`, "warning")}
         ${metric("Com horário", pct(dated / Math.max(1, data.total)), data.undated ? `${fmtNum(data.undated)} sem data` : "Todos os eventos datados")}
-        </div>
-        ${!data.complete ? note("Análise interrompida. Atualize para calcular o conjunto completo.") : ""}
+        </div></details>
         <div id="ws-attention" hidden></div>
         <section class="ws-card"><div class="card-heading"><h2>Eventos no tempo</h2><button class="text-button" data-action="timeline">Ver atividade <i class="fas fa-arrow-right"></i></button></div><div class="timeline-chart" id="ws-timeline"></div></section>
-        <div class="overview-grid"><div>
-        <section class="ws-card"><div class="card-heading"><h2>Ocorrências em destaque</h2><span>${data.findings.length ? data.findings.length + (data.findings.length === 1 ? " indicação" : " indicações") : ""}</span></div>
-        ${data.findings.length ? data.findings.map((f, i) => `<article class="finding"><i class="finding-icon ${esc(f.kind)} fas ${f.kind === "spike" ? "fa-arrow-trend-up" : f.kind === "quality" ? "fa-clock" : f.kind === "gap" ? "fa-arrows-left-right" : "fa-layer-group"}"></i><div><h3>${esc(f.title)}</h3><p>${esc(f.detail)}</p><button class="text-button" data-action="finding" data-index="${i}">${f.kind === "quality" ? "Revisar data/hora" : "Investigar"}<i class="fas fa-arrow-right"></i></button></div><div class="finding-actions">${iconButton("save-finding", "fa-bookmark", "Salvar evidência", i)}</div></article>`).join("") : '<p class="quiet-empty">Nenhuma concentração de erros ou lacuna destacada neste recorte. Você pode explorar os padrões e comparar períodos.</p>'}</section>
+        <details class="op-secondary"><summary>Padrões, origens e ferramentas</summary><div class="overview-grid"><div>
         <section class="ws-card"><div class="card-heading"><h2>Padrões de mensagem</h2><span>Mais frequentes</span></div>${data.patterns_limited ? note("O limite de 20.000 padrões foi atingido. Refine o período; padrões adicionais não aparecem nesta lista.") : ""}<table class="ws-table"><thead><tr><th>Mensagem</th><th class="num">Eventos</th></tr></thead><tbody>${data.patterns.slice(0, 14).map((p, i) => `<tr><td><button class="pattern-button" data-action="pattern" data-index="${i}">${esc(p.pattern || "Mensagem vazia")}</button><div class="pattern-meta">${esc(p.example.source || "Sem origem")}${p.errors ? ` · ${fmtNum(p.errors)} erros` : ""}</div></td><td class="num">${fmtNum(p.count)}<br><span class="count-bar" style="width:${90 * p.count / Math.max(1, data.patterns[0].count)}px"></span></td></tr>`).join("")}</tbody></table></section>
         </div><div><section class="ws-card"><div class="card-heading"><h2>Origens</h2><button class="text-button" data-action="sources">Ver fontes <i class="fas fa-arrow-right"></i></button></div>${data.sources.map(([source, count]) => `<button class="source-row source-filter" data-source="${esc(source)}"><i class="fas fa-server"></i><span class="source-name"><strong>${esc(source)}</strong><small>${pct(count / Math.max(1, data.total))} do recorte</small></span><span class="source-amount">${fmtNum(count)}</span></button>`).join("")}${data.sources_other ? `<div class="source-row"><span class="source-name">Outras origens</span><span>${fmtNum(data.sources_other)}</span></div>` : ""}</section>
         ${data.latency ? `<section class="ws-card"><div class="card-heading"><h2>${esc(colLabel(data.latency.field))}</h2><span>${fmtNum(data.latency.count)} valores · ${esc(data.latency.unit || "unidade da fonte")}</span></div><div class="latency-values">${["p50", "p95", "p99"].map(k => `<div><span>${k.toUpperCase()}</span><strong>${fmtNum(Math.round(data.latency[k] * 100) / 100)}</strong></div>`).join("")}</div><p class="quiet-empty">${data.latency.sampled < data.latency.count ? `Percentis estimados em ${fmtNum(data.latency.sampled)} valores distribuídos.` : "Percentis de todos os valores disponíveis."}${data.latency.incompatible ? ` ${fmtNum(data.latency.incompatible)} valores com outra unidade foram excluídos.` : ""}</p></section>` : ""}
-        <section class="ws-card"><div class="card-heading"><h2>Investigar</h2></div><div class="recipe-list"><button data-action="errors"><i class="fas fa-circle-exclamation"></i>Ver erros e falhas<i class="fas fa-arrow-right"></i></button><button data-action="compare"><i class="fas fa-code-compare"></i>Comparar períodos<i class="fas fa-arrow-right"></i></button><button data-action="explore"><i class="fas fa-list"></i>Explorar todos os eventos<i class="fas fa-arrow-right"></i></button><button data-action="hunt"><i class="fas fa-crosshairs"></i>Caçar ameaças<i class="fas fa-chevron-down"></i></button></div></section></div></div>`;
+        <section class="ws-card"><div class="card-heading"><h2>Investigar</h2></div><div class="recipe-list"><button data-action="errors"><i class="fas fa-circle-exclamation"></i>Ver erros e falhas<i class="fas fa-arrow-right"></i></button><button data-action="compare"><i class="fas fa-code-compare"></i>Comparar períodos<i class="fas fa-arrow-right"></i></button><button data-action="explore"><i class="fas fa-list"></i>Explorar todos os eventos<i class="fas fa-arrow-right"></i></button><button data-action="hunt"><i class="fas fa-crosshairs"></i>Caçar ameaças<i class="fas fa-chevron-down"></i></button></div></section></div></div></details>`;
       drawTimeline(data);
+      const owner=window.AnalysisContexts?.capture();
+      const current = () => version === serial && contextKey === sourceKey() && page === "summary" && (!owner || window.AnalysisContexts.isCurrent(owner));
+      const scope=workspaceScope(), captured=analyticsRequest(scope);
+      window.Operational.mount($("#ws-signals"), data, { current, captured, scope, save:saveDiagnostic, showPage,
+        request:(name,args)=>api(name,{...captured,...args},{silent:true,background:true}),
+        review:async (path, choice)=>{
+          const spec=window.Operational.withChoice(state.currentArtifact?.source,path,choice);
+          if(!spec)throw Error("Reabra o arquivo na Análise para escolher uma lista.");
+          if(current() && await loadData(spec,{restoreCurrentFilters:true})){
+            window.Operational.rememberChoice(path,choice); await showPage("summary");
+          }
+        } });
       window.Security?.fillSummary({ attention: $("#ws-attention") });
     } catch (e) { if (version === serial && contextKey === sourceKey() && page === "summary") { if (state.activeOperation?.kind === "summary") finishOperation("Resumo não concluído"); failed(e); } }
     finally { if (version === serial && contextKey === sourceKey() && state.activeOperation?.kind === "summary") finishOperation("Pronto"); }
@@ -562,6 +571,18 @@
     }
     const index = c.items.indexOf(item); if (index < 0) return false;
     removedEvidence = { item, caseId: c.id, index }; c.items.splice(index, 1); await saveCases(); renderEvidence(); return true;
+  }
+  async function saveDiagnostic(rows, metadata, guard) {
+    if (!guard() || !rows.length) return null;
+    if (window.CaseEvidence?.active === true) return saveNativeRows(rows, metadata, { guard });
+    const c = ensureCase();
+    const item = { id:nid(), createdAt:Date.now(), kind:"grupo", relevance:"normal", origin:state.currentOrigin,
+      artifactId:state.currentArtifact?.id, sourceSpec:structuredClone(state.currentArtifact?.source), stationId:null,
+      includedCount:rows.length, rows:structuredClone(rows), ...metadata };
+    queueCustody(registerCurrentArtifact(c));
+    c.items.push(item);
+    if (await saveCases()) { updateCounts(); return item; }
+    return null;
   }
   async function saveFinding(finding) {
     if (workspaceScope() === "case") { toast("Estes registros já pertencem ao Caso.", "info"); return; }

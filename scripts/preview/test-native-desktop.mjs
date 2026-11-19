@@ -28,6 +28,7 @@ const fixture = resolve(output, "fixture.jsonl"), eventCount = 5000, epoch = 1_7
 const events = Array.from({ length: eventCount }, (_, i) => ({
   timestamp: epoch + i * 1000, source: `svc-${i % 6}`, code: String(100 + i % 11),
   level: i % 4 === 0 ? "error" : "info",
+  estado: i === 4777 ? "divergente" : "sincronizado",
   message: `native row ${i}${i % 97 === 0 ? " rare-needle" : ""} token=fixture-secret-${i}`,
   token: `fixture-secret-${i}`, nested: { label: 'ação 東京, "quoted"', ordinal: i },
 }));
@@ -371,6 +372,41 @@ try {
   await engineState(page, false);
   assert.deepEqual(await engineManifests(), [], "disabled baseline must not construct advanced stores");
   checkpoint("source-loaded", { eventCount, fixture });
+  await page.evaluate(() => Workspace.showPage("summary"));
+  const rareRow = page.locator("#ws-signals .op-row").filter({ hasText: "divergente" });
+  await rareRow.waitFor({ timeout: 120_000 });
+  await rareRow.click();
+  const inline = page.locator("#ws-signals .op-detail:visible");
+  await inline.getByRole("button", { name: "Registros", exact: true }).click();
+  assert.ok((await inline.locator(".op-raw").innerText()).includes("native row 4777"), "the scoped native report opens the outlier's original record");
+  await rareRow.press("Escape");
+  assert.equal(await rareRow.getAttribute("aria-expanded"), "false");
+  checkpoint("native-operational-evidence", { row: 4777, sourcePopulation: 834 });
+  const backups = resolve(output,"backup.jsonl");
+  const backupRows=[];
+  for(let i=0;i<240;i++) {
+    for(const [step,stage] of ["Início","Verificação","Conclusão"].entries()){
+      if(step===1&&i%17===8&&i<204)continue;
+      backupRows.push({timestamp:epoch+i*60_000+step*5000,source:"Serviço de backup",stage,copy_id:"C-"+String(i+1).padStart(3,"0")});
+    }
+  }
+  await writeFile(backups,backupRows.map(row=>JSON.stringify(row)).join("\n"));
+  await page.evaluate(path=>loadData({kind:"file",path,paths:[path],format:"jsonl"}),backups);
+  await ready(page);
+  await page.evaluate(()=>Workspace.showPage("summary"));
+  const stages=page.locator("#ws-signals .op-row").filter({hasText:"Etapa sem registro"});
+  await stages.waitFor({timeout:120_000});
+  assert.match(await stages.innerText(),/12\s*\/\s*240/);
+  await stages.click();
+  await inline.getByText("Ausente",{exact:true}).waitFor();
+  await inline.getByRole("button",{name:"Verificação",exact:true}).click();
+  assert.match(await inline.locator(".op-raw").innerText(),/Verificação/);
+  await page.locator("#ws-signals").scrollIntoViewIfNeeded();
+  await page.screenshot({path:resolve(output,"resumo-backup.png")});
+  checkpoint("native-operation-reference",{affected:12,operations:240});
+  await page.evaluate(path=>loadData({kind:"file",path,paths:[path],format:"jsonl"}),fixture);
+  await ready(page);
+  await page.evaluate(() => Workspace.showPage("explore"));
   await detailInspection(page);
   const baseline = await queries(page);
   assert.equal(baseline["all-first"].total, eventCount);

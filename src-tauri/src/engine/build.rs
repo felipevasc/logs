@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Store layout version; part of every store key.
-pub(crate) const STORE_VERSION: u32 = 5;
+pub(crate) const STORE_VERSION: u32 = 6;
 /// Lines sampled to choose which fields become their own columns.
 const SAMPLE: usize = 20_000;
 /// Fields beyond this many live in the overflow lists (still exact, slower).
@@ -276,6 +276,7 @@ pub(crate) fn copy_part(
 ) -> PartSource {
     PartSource {
         part: FilePart {
+            batches: part.batches.clone(),
             path: part.path.clone(),
             physical_path: part.physical_path.clone(),
             physical_file_id: part.physical_file_id,

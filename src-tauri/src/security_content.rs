@@ -300,14 +300,7 @@ pub fn apply(ev: &Event, derived: &mut Event, n: &mut Normalized) {
         }
     }
     let denied = matches!(n.get("outcome"), Some("blocked" | "failure"))
-        || ["http.response.status_code", "status", "status_code"]
-            .iter()
-            .filter_map(|f| norm::field_value(ev, f))
-            .any(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str()?.parse().ok())
-                    .is_some_and(|v| v >= 400)
-            });
+        || crate::entities::http_status(ev).is_some_and(|status|status>=400);
     let mut response_fields = vec![
         "http.response.body.content".to_string(),
         "http.response.body".into(),

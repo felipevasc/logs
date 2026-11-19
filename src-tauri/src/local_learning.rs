@@ -107,7 +107,7 @@ pub fn event_context(event: &crate::model::Event) -> Value {
                 .filter(|v| !v.trim().is_empty() && v.chars().count() <= 256)
         })
     };
-    json!({"operation":first(&["http.route","operation.name","operation"]),"version":first(&["service.version","app.version","deployment.version","version"]),"dependency":first(&["dependency.name","destination.service.name","db.system","server.address"]),"trace":first(&["trace.id","trace_id","traceId","request.id","request_id","requestId","correlation_id"]),"failure":crate::insights::is_error(event)})
+    json!({"operation":first(&["http.route","operation.name","operation"]),"version":first(&["service.version","app.version","deployment.version","version"]),"dependency":first(&["dependency.name","destination.service.name","db.system","server.address"]),"trace":first(&["trace.id","trace_id","traceId","request.id","request_id","requestId","correlation_id"]),"failure":matches!(crate::entities::action_outcome(event).1,Some("failure"|"blocked"))})
 }
 pub fn profile_path() -> PathBuf {
     let mut mappings =
@@ -991,25 +991,25 @@ fn build_incidents(db: &Connection) -> Result<u64, String> {
     Ok(total)
 }
 fn contrasts(db: &Connection, context: &str, start: i64, end: i64) -> Result<Vec<Value>, String> {
-    let (population,hits):(u64,u64)=db.query_row("SELECT count(*),sum(EXISTS(SELECT 1 FROM learning_flags f WHERE f.ref=i.ref)) FROM learning_input i WHERE context=?1 AND valid AND ts BETWEEN ?2 AND ?3",params![context,start,end],|r|Ok((r.get(0)?,r.get(1)?))).map_err(error)?;
+    let population: u64 = db.query_row("SELECT count(*) FROM learning_input WHERE context=?1 AND valid AND ts BETWEEN ?2 AND ?3",params![context,start,end], |r| r.get(0)).map_err(error)?;
     let mut result = Vec::new();
     // Field names are constants. Both cohorts share namespace, source, service,
     // operation and time, preventing unrelated populations from becoming controls.
     for field in ["host", "version", "dependency"] {
-        let sql=format!("SELECT {field},count(*),sum(EXISTS(SELECT 1 FROM learning_flags f WHERE f.ref=i.ref)) FROM learning_input i WHERE context=?1 AND valid AND ts BETWEEN ?2 AND ?3 AND {field}<>'' GROUP BY {field} ORDER BY count(*) DESC,{field} LIMIT 32");
+        let sql=format!("SELECT {field},count(*),sum(EXISTS(SELECT 1 FROM learning_flags f WHERE f.ref=i.ref)), sum(count(*)) OVER(), sum(sum(EXISTS(SELECT 1 FROM learning_flags f WHERE f.ref=i.ref))) OVER() FROM learning_input i WHERE context=?1 AND valid AND ts BETWEEN ?2 AND ?3 AND trim({field})<>'' GROUP BY {field} ORDER BY count(*) DESC,{field} LIMIT 32");
         let mut statement = db.prepare(&sql).map_err(error)?;
         for row in statement
             .query_map(params![context, start, end], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, u64>(1)?,
-                    r.get::<_, u64>(2)?,
+                    r.get::<_, u64>(2)?, r.get::<_, u64>(3)?, r.get::<_, u64>(4)?,
                 ))
             })
             .map_err(error)?
         {
-            let (value, n, k) = row.map_err(error)?;
-            let rest = population - n;
+            let (value, n, k, known, hits) = row.map_err(error)?;
+            let rest = known - n;
             let rest_hits = hits - k;
             if n < 5 || k < 3 {
                 continue;
@@ -1023,7 +1023,7 @@ fn contrasts(db: &Connection, context: &str, start: i64, end: i64) -> Result<Vec
             let lower = log_learning::rate_interval(k, n).0;
             let upper = log_learning::rate_interval(rest_hits, rest).1;
             let discriminates = rest >= 5 && lower > upper;
-            result.push(json!({"field":field,"value":value,"observations":n,"unusual":k,"rate":rate,"comparison_observations":rest,"comparison_unusual":rest_hits,"comparison_rate":other,"status":if discriminates{"supports_association"}else if rest<5{"insufficient_controls"}else{"inconclusive"},"hypothesis":if discriminates{format!("Investigar a diferença associada a {field}={value}; o desvio se concentra nesse grupo.")}else{"A comparação disponível não distingue esta hipótese.".into()},"limitations":["Associação observacional; não demonstra causa.","Comparações exploratórias exigem confirmação independente."]}));
+            result.push(json!({"field":field,"value":value,"observations":n,"unusual":k,"rate":rate,"unknown_observations":population-known,"comparison_observations":rest,"comparison_unusual":rest_hits,"comparison_rate":other,"status":if discriminates{"supports_association"}else if rest<5{"insufficient_controls"}else{"inconclusive"},"hypothesis":if discriminates{format!("Investigar a diferença associada a {field}={value}; o desvio se concentra nesse grupo.")}else{"A comparação disponível não distingue esta hipótese.".into()},"limitations":["Associação observacional; não demonstra causa.","Comparações exploratórias exigem confirmação independente."]}));
         }
     }
     result.sort_by(|a, b| {
@@ -1041,6 +1041,21 @@ fn contrasts(db: &Connection, context: &str, start: i64, end: i64) -> Result<Vec
     });
     result.truncate(6);
     Ok(result)
+}
+
+#[cfg(test)]
+#[test]
+fn missing_versions_do_not_become_the_control_group() {
+    let db=Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE learning_input(context,valid,ts,ref,host,version,dependency);
+        CREATE TABLE learning_flags(ref);
+        WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM x WHERE i<50)
+        INSERT INTO learning_input SELECT 'app',1,1,i,'',CASE WHEN i<=10 THEN 'v2' ELSE '' END,'' FROM x;
+        INSERT INTO learning_flags SELECT ref FROM learning_input WHERE version='v2';").unwrap();
+    let comparisons=contrasts(&db,"app",0,2).unwrap();
+    let row=comparisons.iter().find(|r|r["field"]=="version").unwrap();
+    assert_eq!(row["unknown_observations"],40);assert_eq!(row["comparison_observations"],0);
+    assert_eq!(row["status"],"insufficient_controls");
 }
 
 pub fn reset() -> Result<Value, String> {

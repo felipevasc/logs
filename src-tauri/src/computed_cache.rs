@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 const MAX_BYTES: u64 = 32 << 20;
 // Bump this only when result semantics change, not for every desktop release.
-pub(crate) const SEMANTICS: &str = "0.13.2";
+pub(crate) const SEMANTICS: &str = "operational-outcomes-v1";
 
 pub(crate) fn case_signature(events: &[crate::model::Event]) -> Option<String> {
     let owner = crate::analysis_runtime::current().map(|admitted| admitted.identity.clone());

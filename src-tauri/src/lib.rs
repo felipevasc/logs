@@ -105,6 +105,7 @@ mod metadata_store;
 mod insights;
 mod java_stacktrace;
 mod journeys;
+mod operational;
 mod mcp;
 mod model;
 mod operations;
@@ -2385,6 +2386,7 @@ pub fn run() {
             threats::threat_catalog_update,
             threats::threat_scan,
             threats::threat_events,
+            operational::operational_report,
             journeys::journey_fields,
             journeys::journey_index,
             journeys::journey_events,
