@@ -2,6 +2,7 @@
 // Never modifies the original test executable or changes the Cargo step's result.
 import { readFileSync, writeFileSync, copyFileSync, existsSync, openSync, closeSync } from 'node:fs';
 import { resolve, dirname, basename, join } from 'node:path';
+import { isCargoTestBinary } from './windows-harness-path.mjs';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -85,7 +86,7 @@ function diagnose(destination) {
     const entries = (Array.isArray(raw) ? raw : [raw]).filter(e => e.selection === 'cargo-failed-process' && /^loginsight_lib-[\w-]+\.exe$/i.test(basename(e.path)));
     if (entries.length !== 1) return stop('No unique exact failed unit-test executable');
     original = resolve(entries[0].path);
-    if (dirname(original).toLowerCase() !== resolve('src-tauri/target/release/deps').toLowerCase()) return stop('Unexpected executable directory');
+    if (!isCargoTestBinary(resolve('src-tauri/target/release'), original, true)) return stop('Unexpected executable directory');
     const before = inspectPe(readFileSync(original));
     originalHash = before.sha256;
     report.original = { path: original, ...before };

@@ -69,7 +69,9 @@ try {
     active = spawnManaged([fixture, mode, 'quotes" and trailing\\'], { cwd: resolve('.'), stdout: 'pipe' });
     const pids = [];
     await new Promise((done, reject) => {
-      const timer = setTimeout(() => reject(Error(`Fixture startup timed out: ${mode}`)), 15_000);
+      // A cold hosted Windows runner starts PowerShell plus three Node processes
+      // before readiness. The cleanup deadline is measured separately below.
+      const timer = setTimeout(() => reject(Error(`Fixture startup timed out: ${mode}`)), process.platform === 'win32' ? 60_000 : 15_000);
       let buffer = '';
       active.closed.then(({ code }) => { clearTimeout(timer); if (!pids.length) reject(Error(`Fixture failed to start (${code})`)); }, reject);
       active.stdout.on('data', data => {

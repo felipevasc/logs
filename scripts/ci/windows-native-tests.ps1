@@ -14,19 +14,21 @@ try {
     # Cargo identifies the failed executable even when no harness output exists.
     $log = Get-Content (Join-Path $destination 'cargo-test.log') -Raw
     $failures = [regex]::Matches($log, '(?m)process didn.t exit successfully:\s*`([^`]+?\.exe)(?:\s[^`]*)?`')
-    $target = [IO.Path]::GetFullPath((Join-Path $PWD 'src-tauri/target/release/deps'))
+    $target = Join-Path $PWD 'src-tauri/target/release'
     $executables = @($failures | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
     $selection = 'cargo-failed-process'
     if ($executables.Count -eq 0) {
         # Explicit fallback only; never label an inferred candidate as the failure.
         $selection = 'newest-unit-test-candidate; failed path absent from Cargo log'
-        $executables = @(Get-ChildItem -LiteralPath $target -Filter 'loginsight_lib-*.exe' -ErrorAction SilentlyContinue |
+        $candidates = @((Join-Path $target 'deps/loginsight_lib-*.exe'), (Join-Path $target 'build/loginsight/*/out/loginsight_lib-*.exe'))
+        $executables = @(Get-ChildItem -Path $candidates -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 -ExpandProperty FullName)
     }
     $identities = @()
     foreach ($executable in $executables) {
-        $path = [IO.Path]::GetFullPath($executable)
-        if (!$path.StartsWith($target + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        $path = [IO.Path]::GetFullPath($executable, $PWD.Path)
+        & node (Join-Path $PSScriptRoot 'windows-harness-path.mjs') $target $path
+        if ($LASTEXITCODE -ne 0) {
             throw 'Cargo executable path is outside the expected test output directory.'
         }
         $file = Get-Item -LiteralPath $path
